@@ -1137,7 +1137,7 @@ def _extract_section(text: str, section: str, rel_path: str) -> str:
     "punctuation don't matter ('nuru mcp' finds Nuru-MCP.md); if nothing matches, the error lists the "
     "closest notes. section: optional heading text (e.g. 'Decisions') to return just that part of a long "
     "note, through to the next heading of the same or higher level; an unknown section lists the note's "
-    "headings. Set include_revision=true for a whole-note {path, content, revision} result before replacement. For a note's tags, links and open tasks without its text, use note_info."
+    "headings. Set include_revision=true for a whole-note {path, content, revision} result before replacement; this mode rejects ambiguous names (use an exact path) and cannot select a section. Ordinary reads pick the first alphabetical match. For a note's tags, links and open tasks without its text, use note_info."
 )
 @_tool
 def read_note(name: str, section: str | None = None, include_revision: bool = False) -> str | dict[str, str]:

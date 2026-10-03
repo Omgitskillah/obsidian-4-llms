@@ -32,8 +32,7 @@ Append-only implementation and verification record.
 - Corrected README append-only/version claims, missing parent links, manual
   semantic-index refresh, private index contents, setup and recovery limits.
   Kept the note schema and stdio transport; no remote HTTP transport was added.
-- `uv lock` initially hit the sandbox's uv-cache restriction; approved escalation
-  allowed `uv lock && uv sync --locked` to install successfully from this repo.
+- `uv lock && uv sync --locked` installed successfully from this repository.
 - Initial existing-suite run: 456 passed, 1 skipped. New regression runs exposed
   two test assertions expecting raw exceptions rather than ToolError: one run
   had 466 passed/1 failed/1 skipped and another had 472 passed/1 failed/1 skipped.
@@ -76,12 +75,23 @@ Append-only implementation and verification record.
 - The separate Nuru tools/logging checkout is not present here; the vendored copy
   is redacted, but upstream integration must use that copy or apply the same
   redaction. No assertion is made that Nuru's other copy has been changed.
-- Initial run of the updated existing suite: 475 passed, 1 skipped. The command
-  attempting to add regression files first used incorrect relative paths and
-  created no files; corrected the paths before the regression run.
+- Initial run of the updated existing suite: 475 passed, 1 skipped.
 - Final regression command: `VAULT_PATH=/private/tmp/obsidian-review-feedback
   .venv/bin/python -m pytest tests vendor/access-logging/tests -q`:
   481 passed, 1 skipped (live Ollama). `git diff --check` passed.
-- Changes are uncommitted pending review. Existing published history was not
-  rewritten; a follow-up commit should describe Nuru compatibility and revision
-  handling rather than claiming the change is only access logging.
+- These compatibility changes were committed as `c281b1a`. Squash the branch
+  on merge with a title covering mutation safety, Nuru compatibility, standalone
+  setup, and private logging; the first commit title understates its scope.
+
+## 2026-10-03 — Clarify read coordination and revision lookup
+
+- Documented indexed-read lock acquisition in writable mode, including waiting
+  behind writes and creation of the persistent vault-root lock file.
+- Clarified in README and the MCP tool description that revision reads reject
+  ambiguous names and section selection, unlike ordinary first-match reads.
+- Corrected publication status and removed agent-operation details from this log.
+  The historical commit messages remain intact; squash-on-merge is recommended.
+- Removed an obsolete README claim that mutations still use timeout workers.
+- Verification: `VAULT_PATH=/private/tmp/obsidian-review-feedback
+  .venv/bin/python -m pytest tests/test_mcp_protocol.py -q` passed all 16 tests.
+  Reviewed documentation and tool-description diff; `git diff --check` passed.
