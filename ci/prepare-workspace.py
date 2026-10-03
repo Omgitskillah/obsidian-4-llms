@@ -11,6 +11,12 @@ workspace.mkdir(parents=True, exist_ok=False)
 ignore = shutil.ignore_patterns(".git", ".venv", "__pycache__", ".pytest_cache", ".logs", ".db", ".coverage", ".DS_Store", ".env", ".env.*", "vendor")
 shutil.copytree(repo, workspace / "servers/obsidian", ignore=ignore)
 shutil.copytree(repo / "vendor/access-logging", workspace / "tools/logging", ignore=ignore)
+# The standalone package uses its vendored path; staged legacy CI uses workspace.
+package = workspace / "servers/obsidian/pyproject.toml"
+package.write_text(package.read_text().replace(
+    'access-logging = { path = "vendor/access-logging" }',
+    'access-logging = { workspace = true }',
+))
 for name in ("pyproject.toml", "uv.lock"):
     source = repo / "ci" / name
     if source.exists():

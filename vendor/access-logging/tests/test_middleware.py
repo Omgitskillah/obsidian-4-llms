@@ -170,7 +170,7 @@ def test_log_line_format_for_successful_call(tmp_path):
     assert request["event"] == "request"
     assert request["method"] == "tools/call"
     assert request["tool_name"] == "list_notes"
-    assert request["params"] == {"name": "list_notes", "arguments": {}}
+    assert request["params"] is None
 
     assert response["request_id"] == request["request_id"]
     assert response["event"] == "response"
@@ -193,7 +193,7 @@ def test_failed_call_is_logged_as_error_and_exception_still_propagates(tmp_path)
     entries = read_entries(log_files(tmp_path)[0])
     response = entries[3]
     assert response["status"] == "error"
-    assert response["error"] == "boom"
+    assert response["error"] == "ValueError"
 
 
 def test_call_next_return_value_is_passed_through(tmp_path):
@@ -261,3 +261,13 @@ def test_logging_failure_does_not_break_the_request(tmp_path, monkeypatch):
     result = run(middleware(FakeContext("tools/call", {}), call_next_ok("fine")))
 
     assert result == "fine"
+
+
+def test_private_arguments_results_and_error_messages_are_not_logged(tmp_path):
+    middleware = AccessLogMiddleware(tmp_path)
+    secret = "private-note-and-token"
+    ctx = FakeContext("tools/call", {"name": "write_note", "arguments": {"content": secret}})
+    run(middleware(ctx, call_next_ok(secret)))
+    with pytest.raises(ValueError):
+        run(middleware(ctx, call_next_raises(ValueError(secret))))
+    assert secret not in log_files(tmp_path)[0].read_text()

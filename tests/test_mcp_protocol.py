@@ -159,3 +159,29 @@ def test_find_in_notes_bad_pattern_reaches_the_caller_with_ripgreps_message_thro
         _run(server.mcp.call_tool("find_in_notes", {"pattern": "("}))
 
     assert "unclosed group" in str(exc_info.value)
+
+
+def test_snapshot_revision_and_replace_through_protocol(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "VAULT_PATH", tmp_path)
+    server.write_note("original", note="Plan")
+    snapshot_result = _run(server.mcp.call_tool("read_note_snapshot", {"name": "Plan"}))
+    snapshot = json.loads(snapshot_result.content[0].text)
+    result = _run(server.mcp.call_tool("write_note", {
+        "note": snapshot["path"], "content": "updated", "mode": "replace",
+        "expected_revision": snapshot["revision"],
+    }))
+    assert result.is_error is not True
+    assert server.read_note("Plan").endswith("updated")
+    with pytest.raises(ToolError, match="Revision conflict"):
+        _run(server.mcp.call_tool("write_note", {
+            "note": "Plan", "content": "stale", "mode": "replace",
+            "expected_revision": snapshot["revision"],
+        }))
+
+
+def test_read_only_is_enforced_through_protocol(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "VAULT_PATH", tmp_path)
+    monkeypatch.setenv("OBSIDIAN_READ_ONLY", "1")
+    with pytest.raises(ToolError, match="Read-only"):
+        _run(server.mcp.call_tool("write_note", {"note": "Plan", "content": "no"}))
+    assert not list(tmp_path.iterdir())

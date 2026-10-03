@@ -5,7 +5,6 @@ Run standalone via stdio with: uv run obsidian-mcp
 """
 
 import base64
-import concurrent.futures
 import contextlib
 import difflib
 import functools
@@ -31,6 +30,7 @@ from ulid import ULID
 from obsidian_mcp import frontmatter_template as template
 from obsidian_mcp import index as note_index
 from obsidian_mcp import semantic
+from obsidian_mcp import mutations
 
 load_dotenv(semantic.ENV_FILE)
 
@@ -135,34 +135,19 @@ LOG_DIR = Path(os.environ.get("OBSIDIAN_MCP_LOG_DIR", Path(__file__).resolve().p
 
 mcp = MCPServer("obsidian-mcp", middleware=[AccessLogMiddleware(LOG_DIR)])
 
-# Filesystem-mutating tools run their I/O through this so a stalled write
-# surfaces as a clear, fast TimeoutError instead of the caller hanging for
-# minutes. Small pool: these are local-disk writes, not a workload that needs
-# concurrency.
-_IO_TIMEOUT_SECONDS = 10.0
-_io_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="obsidian-mcp-io")
-
+_IO_TIMEOUT_SECONDS = 10.0  # Subprocess search deadline, never a write deadline.
 _T = TypeVar("_T")
 
 
-def _run_with_timeout(fn: Callable[[], _T]) -> _T:
-    """Run fn() with a hard deadline instead of letting it block forever.
-
-    Python has no safe way to forcibly kill a thread stuck in a blocking
-    syscall, so on timeout the underlying thread is abandoned rather than
-    cancelled - it may still complete (and write to disk) after this raises.
-    Callers must use atomic filesystem operations (exclusive create, rename)
-    so a late write from an abandoned thread can't silently clobber a
-    successful retry.
-    """
-    future = _io_executor.submit(fn)
-    try:
-        return future.result(timeout=_IO_TIMEOUT_SECONDS)
-    except concurrent.futures.TimeoutError as e:
-        raise TimeoutError(
-            f"Vault filesystem operation timed out after {_IO_TIMEOUT_SECONDS:.0f}s. "
-            "VAULT_PATH may be on a stalled or unavailable filesystem."
-        ) from e
+def _mutation(fn: Callable[..., _T]) -> Callable[..., _T]:
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> _T:
+        if os.environ.get("OBSIDIAN_READ_ONLY") == "1":
+            raise PermissionError("Read-only mode: vault mutations are disabled")
+        # Run to completion. A timeout must not leave an abandoned writer behind.
+        with mutations.coordinate(VAULT_PATH):
+            return fn(*args, **kwargs)
+    return wrapper
 
 
 # Every exception type a tool below deliberately raises for an anticipated
@@ -399,8 +384,12 @@ def _indexed_notes() -> dict[str, dict[str, str]]:
     """
     if not (VAULT_PATH / _INDEX_DB_NAME).is_file():
         return {}
-    with contextlib.closing(_open_index()) as conn:
-        return note_index.all_by_path(conn)
+    db = VAULT_PATH / _INDEX_DB_NAME
+    if db.is_symlink():
+        raise ValueError("Index database must not be a symlink")
+    with contextlib.closing(sqlite3.connect(f"{db.as_uri()}?mode=ro", uri=True)) as conn:
+        return {path: row for path, row in note_index.all_by_path(conn).items()
+                if (VAULT_PATH / path).is_file() and _is_within_vault(VAULT_PATH / path)}
 
 
 def _read_frontmatter(text: str) -> dict[str, Any]:
@@ -1187,6 +1176,17 @@ def read_note(name: str, section: str | None = None) -> str:
     return _extract_section(text, section, _rel(target))
 
 
+@mcp.tool(description="Read a note with its SHA-256 revision. Use the revision as expected_revision for write_note replacement.")
+@_tool
+def read_note_snapshot(name: str) -> dict[str, str]:
+    matches = _resolve_notes(name)
+    if len(matches) != 1:
+        raise ValueError("Ambiguous note: pass its exact path")
+    target = matches[0]
+    data = mutations.read(VAULT_PATH, target)
+    return {"path": _rel(target), "content": data.decode("utf-8"), "revision": mutations.revision(data)}
+
+
 def _link_targets(text: str) -> list[str]:
     """The distinct [[wikilink]] targets in `text`, in order of first appearance.
 
@@ -1392,8 +1392,16 @@ def _open_index() -> sqlite3.Connection:
     long-running process has no other hook for) keeps it correct regardless
     of when or how the vault changed outside this server's own tools.
     """
-    conn = note_index.connect(VAULT_PATH / _INDEX_DB_NAME)
-    note_index.reconcile(conn, VAULT_PATH)
+    db = VAULT_PATH / _INDEX_DB_NAME
+    for candidate in (db, Path(f"{db}-journal"), Path(f"{db}-wal"), Path(f"{db}-shm")):
+        if candidate.is_symlink():
+            raise ValueError("Index database and sidecars must not be symlinks")
+    conn = note_index.connect(db)
+    try:
+        note_index.reconcile(conn, VAULT_PATH)
+    except BaseException:
+        conn.close()
+        raise
     return conn
 
 
@@ -1555,6 +1563,7 @@ def _find_daily(day: str) -> Path | None:
 
 
 @_tool
+@_mutation
 def create_note(
     type: str,
     title: str,
@@ -1570,8 +1579,8 @@ def create_note(
     """Create a new note, with server-owned frontmatter, in the vault - write_note's
     create path, not a tool of its own.
 
-    Notes are append-only after creation: frontmatter is written exactly
-    once, here, and never rewritten - write_note adds to the body.
+    Frontmatter is written exactly once here. write_note can append to or
+    revision-check and replace the body without changing frontmatter.
 
     Args:
         type: One of: directives, daily, correction, profile, preferences,
@@ -1686,14 +1695,8 @@ def create_note(
     file_content = f"---\n{frontmatter}---\n\n# {title}\n\n{body}"
 
     def _create() -> None:
-        target.parent.mkdir(parents=True, exist_ok=True)
         try:
-            # "x" mode opens with O_EXCL: the existence check and the create
-            # are one atomic filesystem operation, so two callers racing on
-            # the same path (e.g. a client retrying after a timeout while an
-            # earlier, abandoned attempt is still landing) can't both succeed.
-            with target.open("x") as f:
-                f.write(file_content)
+            mutations.create(VAULT_PATH, target, file_content.encode("utf-8"))
         except FileExistsError as e:
             raise FileExistsError(f"A note already exists at '{rel_path}'.") from e
 
@@ -1715,7 +1718,7 @@ def create_note(
             # above - e.g. two callers racing on the same title. Give a
             # message instead of letting a bare sqlite3 error reach the
             # caller as the framework's generic, contentless crash message.
-            target.unlink(missing_ok=True)
+            mutations.remove(VAULT_PATH, target, file_content.encode("utf-8"))
             raise ValueError(
                 f"The index already has an entry for path '{rel_path}' or id '{note_id}'."
             ) from e
@@ -1723,10 +1726,10 @@ def create_note(
             # The index insert is what makes this note visible to
             # supersedes and id lookups - if it fails, the file must
             # not stand, so a retry doesn't collide with a half-created note.
-            target.unlink(missing_ok=True)
+            mutations.remove(VAULT_PATH, target, file_content.encode("utf-8"))
             raise
 
-    _run_with_timeout(_create)
+    _create()
     return {"id": note_id, "path": rel_path}
 
 
@@ -1748,15 +1751,11 @@ def _blank_line_separator(existing: str) -> str:
     return "\n\n"
 
 
-def _append_text(target: Path, content: str) -> None:
+def _append_text(target: Path, content: str, before: bytes) -> None:
     """Append content to a note's file, starting its own paragraph (see _blank_line_separator)."""
 
-    def _append() -> None:
-        separator = _blank_line_separator(target.read_text())
-        with target.open("a") as f:
-            f.write(separator + content)
-
-    _run_with_timeout(_append)
+    separator = _blank_line_separator(before.decode("utf-8"))
+    mutations.update(VAULT_PATH, target, before, before + (separator + content).encode("utf-8"))
 
 
 # Shaped like a ULID, as create_note mints them - loosely, so a mistyped id (an O for a 0)
@@ -1842,7 +1841,8 @@ _TYPE_LINES = "; ".join(f"{name} = {what}" for name, what in template.TYPE_DESCR
         "Write to a note, creating it if it doesn't exist. note: an existing note's path, title or id; or, for "
         "a new note, a title (it goes in nuru/) or a path under nuru/ or shared/ such as 'nuru/People/Dana Lee' "
         "(folders are made as needed). content: Markdown. mode: 'append' (default) adds content to the end - send "
-        "ONLY the new text, never the note's existing text; 'replace' makes content the note's whole new text "
+        "ONLY the new text. For replace, first call read_note_snapshot and supply its revision as expected_revision. "
+        "'replace' makes content the note's whole new text "
         "(frontmatter kept), so send the complete note - only for notes in nuru/, and the old version is kept. "
         "type (optional, for a new note; default topic): "
         f"{_TYPE_LINES}. type=daily (no note) writes to your own daily note for today - use it for reminders "
@@ -1855,6 +1855,7 @@ _TYPE_LINES = "; ".join(f"{name} = {what}" for name, what in template.TYPE_DESCR
     )
 )
 @_tool
+@_mutation
 def write_note(
     content: str = "",
     note: str | None = None,
@@ -1865,6 +1866,7 @@ def write_note(
     supersedes: str | None = None,
     targets: list[str] | None = None,
     session: str | None = None,
+    expected_revision: str | None = None,
 ) -> dict[str, Any]:
     """Write `content` to a note, creating the note first if there isn't one.
 
@@ -1958,7 +1960,8 @@ def write_note(
 
     target = matches[0]
     rel_path = _rel(target)
-    text = target.read_text(errors="ignore")
+    before = mutations.read(VAULT_PATH, target)
+    text = before.decode("utf-8")
     frontmatter = _read_frontmatter(text)
     if supersedes is not None or targets is not None:
         raise ValueError(
@@ -1995,6 +1998,10 @@ def write_note(
                 f"'{rel_path}' isn't in {_NURU_FOLDER}/, so it can't be replaced: only Nuru's own notes can be "
                 "rewritten. Add to it with mode=\"append\", or write a correction note that links [[it]]."
             )
+        if expected_revision is None:
+            raise ValueError("Replacement requires expected_revision from read_note_snapshot")
+        if expected_revision != mutations.revision(before):
+            raise ValueError("Revision conflict: reread with read_note_snapshot")
         head = match.group(0) if (match := _FRONTMATTER.match(text)) else ""
         if " ".join(text[len(head):].split()) == " ".join(content.split()):
             return {
@@ -2007,15 +2014,14 @@ def write_note(
         backup = _replaced_copy_path(rel_path)
 
         def _replace() -> None:
-            backup.parent.mkdir(parents=True, exist_ok=True)
-            backup.write_text(text)
-            target.write_text(head + ("\n" if head else "") + content)
+            mutations.create(VAULT_PATH, backup, before)
+            mutations.update(VAULT_PATH, target, before, (head + ("\n" if head else "") + content).encode("utf-8"))
 
-        _run_with_timeout(_replace)
+        _replace()
         done = (f"Replaced the text of the existing note '{title}' at {rel_path} (its frontmatter kept; the old "
                 "version is in trash/).")
     else:
-        _append_text(target, content)
+        _append_text(target, content, before)
         done = f"Added to the end of the existing note '{title}' at {rel_path}."
     note_id = _indexed_notes().get(rel_path, {}).get("id") or frontmatter.get("id")
     return {"done": done, "path": rel_path, "id": note_id, "created": False}
@@ -2029,13 +2035,14 @@ def write_note(
     "it to delete; nothing comes back out of trash. Returns {done, from, to}: done says in words what happened."
 )
 @_tool
+@_mutation
 def rename_or_move_file(source_path: str, destination_path: str) -> dict[str, str]:
     """Rename or move a file within the vault - which is also how a note is archived or deleted.
 
     If a note create_note made is being moved, its index row is repointed to
     the new path in the same operation, so it stays reachable by id
     afterward - this is what makes archive-by-move (a move, not a rewrite)
-    viable under the append-only design.
+    viable without rewriting immutable frontmatter.
 
     Args:
         source_path: Current path of the file, relative to the vault root -
@@ -2089,18 +2096,21 @@ def rename_or_move_file(source_path: str, destination_path: str) -> dict[str, st
         # after the move would see source_rel already gone and delete its
         # row out from under update_path below, rather than repoint it.
         with contextlib.closing(_open_index()) as conn:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            source.rename(destination)
+            indexed = False
             try:
-                note_index.update_path(conn, source_rel, destination_rel)
-            except Exception:
-                # Keep the index and the filesystem in agreement: if the
-                # index update fails, undo the move rather than leave a
-                # note's id pointing at wherever it used to be.
-                destination.rename(source)
+                with mutations.move(VAULT_PATH, source, destination):
+                    note_index.update_path(conn, source_rel, destination_rel)
+                    indexed = True
+            except Exception as error:
+                if indexed:
+                    try:
+                        note_index.update_path(conn, destination_rel, source_rel)
+                    except Exception as recovery:
+                        raise ValueError(f"Move failed; index recovery also failed: {recovery}") from error
                 raise
 
-    _run_with_timeout(_move)
+    _move()
+
     name = destination.stem
     if _is_trashed(destination):
         done = f"Deleted '{name}': moved {source_rel} to {destination_rel}. It can't be brought back from trash by Nuru."
