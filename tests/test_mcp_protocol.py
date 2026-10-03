@@ -164,7 +164,7 @@ def test_find_in_notes_bad_pattern_reaches_the_caller_with_ripgreps_message_thro
 def test_snapshot_revision_and_replace_through_protocol(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "VAULT_PATH", tmp_path)
     server.write_note("original", note="Plan")
-    snapshot_result = _run(server.mcp.call_tool("read_note_snapshot", {"name": "Plan"}))
+    snapshot_result = _run(server.mcp.call_tool("read_note", {"name": "Plan", "include_revision": True}))
     snapshot = json.loads(snapshot_result.content[0].text)
     result = _run(server.mcp.call_tool("write_note", {
         "note": snapshot["path"], "content": "updated", "mode": "replace",
@@ -185,3 +185,31 @@ def test_read_only_is_enforced_through_protocol(tmp_path, monkeypatch):
     with pytest.raises(ToolError, match="Read-only"):
         _run(server.mcp.call_tool("write_note", {"note": "Plan", "content": "no"}))
     assert not list(tmp_path.iterdir())
+
+
+def test_nuru_allowlisted_revision_flow(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, 'VAULT_PATH', tmp_path)
+    monkeypatch.setattr(server, '_PROTECT_USER_AUTHORED', True)
+    server.write_note('original', note='Plan')
+    assert 'read_note_snapshot' not in {t.name for t in _run(server.mcp.list_tools())}
+    result = _run(server.mcp.call_tool('read_note', {'name': 'Plan', 'include_revision': True}))
+    snapshot = json.loads(result.content[0].text)
+    assert snapshot['revision'] == server.note_info('Plan')['revision']
+    _run(server.mcp.call_tool('write_note', {'note': snapshot['path'], 'content': 'updated',
+        'mode': 'replace', 'expected_revision': snapshot['revision']}))
+    assert server.read_note('Plan').endswith('updated')
+
+
+@pytest.mark.parametrize('tool,args', [
+    ('read_note', {'name': 'bad.md'}),
+    ('read_note', {'name': 'bad.md', 'include_revision': True}),
+    ('write_note', {'note': 'bad.md', 'content': 'more'}),
+])
+def test_invalid_utf8_clear_failure_preserves_bytes(tmp_path, monkeypatch, tool, args):
+    monkeypatch.setattr(server, 'VAULT_PATH', tmp_path)
+    path = tmp_path / 'bad.md'
+    original = b'# Bad\ninvalid \xff byte'
+    path.write_bytes(original)
+    with pytest.raises(ToolError, match='invalid UTF-8.*No bytes were discarded'):
+        _run(server.mcp.call_tool(tool, args))
+    assert path.read_bytes() == original

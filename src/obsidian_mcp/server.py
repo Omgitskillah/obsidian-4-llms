@@ -384,6 +384,9 @@ def _indexed_notes() -> dict[str, dict[str, str]]:
     """
     if not (VAULT_PATH / _INDEX_DB_NAME).is_file():
         return {}
+    if os.environ.get("OBSIDIAN_READ_ONLY") != "1":
+        with mutations.coordinate(VAULT_PATH), contextlib.closing(_open_index()) as conn:
+            return note_index.all_by_path(conn)
     db = VAULT_PATH / _INDEX_DB_NAME
     if db.is_symlink():
         raise ValueError("Index database must not be a symlink")
@@ -1134,10 +1137,10 @@ def _extract_section(text: str, section: str, rel_path: str) -> str:
     "punctuation don't matter ('nuru mcp' finds Nuru-MCP.md); if nothing matches, the error lists the "
     "closest notes. section: optional heading text (e.g. 'Decisions') to return just that part of a long "
     "note, through to the next heading of the same or higher level; an unknown section lists the note's "
-    "headings. For a note's tags, links and open tasks without its text, use note_info."
+    "headings. Set include_revision=true for a whole-note {path, content, revision} result before replacement. For a note's tags, links and open tasks without its text, use note_info."
 )
 @_tool
-def read_note(name: str, section: str | None = None) -> str:
+def read_note(name: str, section: str | None = None, include_revision: bool = False) -> str | dict[str, str]:
     """Return the contents of a note (Markdown file) by name - all of it, or one section.
 
     The tags, links, backlinks and open tasks are note_info's. Folding them into read_note as a
@@ -1163,10 +1166,14 @@ def read_note(name: str, section: str | None = None) -> str:
     """
     _check_accessible(VAULT_PATH)
 
+    if include_revision:
+        if section is not None and section.strip():
+            raise ValueError("include_revision requires a whole-note read, without section")
+        return read_note_snapshot(name)
     target = _resolve_note(name)
 
     try:
-        text = target.read_text()
+        text = _decode_note(target.read_bytes())
     except PermissionError as e:
         raise PermissionError(
             f"Access denied to '{target}'. Check the VAULT_PATH env var and its permissions."
@@ -1176,15 +1183,20 @@ def read_note(name: str, section: str | None = None) -> str:
     return _extract_section(text, section, _rel(target))
 
 
-@mcp.tool(description="Read a note with its SHA-256 revision. Use the revision as expected_revision for write_note replacement.")
-@_tool
+def _decode_note(data: bytes) -> str:
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("Note contains invalid UTF-8; repair its encoding before reading or writing. No bytes were discarded.") from error
+
+
 def read_note_snapshot(name: str) -> dict[str, str]:
     matches = _resolve_notes(name)
     if len(matches) != 1:
         raise ValueError("Ambiguous note: pass its exact path")
     target = matches[0]
     data = mutations.read(VAULT_PATH, target)
-    return {"path": _rel(target), "content": data.decode("utf-8"), "revision": mutations.revision(data)}
+    return {"path": _rel(target), "content": _decode_note(data), "revision": mutations.revision(data)}
 
 
 def _link_targets(text: str) -> list[str]:
@@ -1199,7 +1211,7 @@ def _link_targets(text: str) -> list[str]:
 
 @mcp.tool(
     description="What surrounds one note, without its text (read_note gives the text). name: a path, title "
-    "or id, as for read_note. Returns {note, tags, outgoing, backlinks, todos, todo_count, hint}: tags are its "
+    "or id, as for read_note. Returns {note, revision, tags, outgoing, backlinks, todos, todo_count, hint}: tags are its "
     "frontmatter and inline #tags; outgoing is each [[link]] in it as {link, path}, path null when no note "
     "has that name; backlinks are the notes that link to it; todos are its open tasks (unticked checkboxes "
     "and TODO lines) as {line, text}. Each list is capped at 25."
@@ -1217,6 +1229,7 @@ def note_info(name: str) -> dict[str, Any]:
     todos = note_todos(path)
     result: dict[str, Any] = {
         "note": path,
+        "revision": mutations.revision(mutations.read(VAULT_PATH, VAULT_PATH / path)),
         "tags": note_tags(path)["tags"],
         "outgoing": links["outgoing"],
         "backlinks": links["backlinks"],
@@ -1754,7 +1767,7 @@ def _blank_line_separator(existing: str) -> str:
 def _append_text(target: Path, content: str, before: bytes) -> None:
     """Append content to a note's file, starting its own paragraph (see _blank_line_separator)."""
 
-    separator = _blank_line_separator(before.decode("utf-8"))
+    separator = _blank_line_separator(_decode_note(before))
     mutations.update(VAULT_PATH, target, before, before + (separator + content).encode("utf-8"))
 
 
@@ -1841,7 +1854,7 @@ _TYPE_LINES = "; ".join(f"{name} = {what}" for name, what in template.TYPE_DESCR
         "Write to a note, creating it if it doesn't exist. note: an existing note's path, title or id; or, for "
         "a new note, a title (it goes in nuru/) or a path under nuru/ or shared/ such as 'nuru/People/Dana Lee' "
         "(folders are made as needed). content: Markdown. mode: 'append' (default) adds content to the end - send "
-        "ONLY the new text. For replace, first call read_note_snapshot and supply its revision as expected_revision. "
+        "ONLY the new text. For replace, first call read_note with include_revision=true and supply its revision as expected_revision. "
         "'replace' makes content the note's whole new text "
         "(frontmatter kept), so send the complete note - only for notes in nuru/, and the old version is kept. "
         "type (optional, for a new note; default topic): "
@@ -1961,7 +1974,7 @@ def write_note(
     target = matches[0]
     rel_path = _rel(target)
     before = mutations.read(VAULT_PATH, target)
-    text = before.decode("utf-8")
+    text = _decode_note(before)
     frontmatter = _read_frontmatter(text)
     if supersedes is not None or targets is not None:
         raise ValueError(
@@ -1999,9 +2012,9 @@ def write_note(
                 "rewritten. Add to it with mode=\"append\", or write a correction note that links [[it]]."
             )
         if expected_revision is None:
-            raise ValueError("Replacement requires expected_revision from read_note_snapshot")
+            raise ValueError("Replacement requires expected_revision from read_note(include_revision=true)")
         if expected_revision != mutations.revision(before):
-            raise ValueError("Revision conflict: reread with read_note_snapshot")
+            raise ValueError("Revision conflict: reread with read_note(include_revision=true)")
         head = match.group(0) if (match := _FRONTMATTER.match(text)) else ""
         if " ".join(text[len(head):].split()) == " ".join(content.split()):
             return {
