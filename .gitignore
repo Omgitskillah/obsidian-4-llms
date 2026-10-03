@@ -1,0 +1,15 @@
+.logs/
+# before 2026-09-28
+logs/
+
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.env
+.env.*
+!.env.*.example
+.DS_Store
+.coverage
+.pytest_cache/
+.db/

@@ -1,0 +1,18 @@
+[project]
+name = "access-logging"
+version = "0.1.0"
+description = "Generic MCP access-logging middleware, shared across the servers in this repo."
+readme = "README.md"
+requires-python = ">=3.14.7"
+dependencies = [
+    "mcp>=2.2.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.13,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

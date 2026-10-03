@@ -1,0 +1,9 @@
+[tool.uv.workspace]
+members = ["servers/obsidian", "tools/logging"]
+
+[dependency-groups]
+dev = ["obsidian-mcp", "access-logging", "pytest>=9.1.1", "pytest-cov>=7.1.0"]
+
+[tool.uv.sources]
+obsidian-mcp = { workspace = true }
+access-logging = { workspace = true }
