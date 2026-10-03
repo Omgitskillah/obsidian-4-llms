@@ -1027,38 +1027,6 @@ def test_append_note_raises_if_the_indexed_file_was_deleted_outside_the_server(t
         server.write_note("content", note=created["id"])
 
 
-# --- _run_with_timeout ---
-
-
-def test_run_with_timeout_returns_the_function_result():
-    assert server._run_with_timeout(lambda: 42) == 42
-
-
-def test_run_with_timeout_propagates_the_function_s_exception():
-    def _raise():
-        raise ValueError("boom")
-
-    with pytest.raises(ValueError, match="boom"):
-        server._run_with_timeout(_raise)
-
-
-def test_run_with_timeout_raises_timeout_error_on_a_stalled_call(monkeypatch):
-    import threading
-
-    monkeypatch.setattr(server, "_IO_TIMEOUT_SECONDS", 0.05)
-    release = threading.Event()
-
-    def _stall():
-        release.wait(timeout=2)  # simulates a hung filesystem call
-
-    try:
-        with pytest.raises(TimeoutError):
-            server._run_with_timeout(_stall)
-    finally:
-        release.set()  # let the abandoned worker thread finish so it doesn't leak
-
-
-
 # --- rename_or_move_file ---
 
 
@@ -2326,7 +2294,7 @@ def test_replace_rewrites_the_body_and_keeps_the_frontmatter(tmp_path, monkeypat
     before = (tmp_path / made["path"]).read_text()
     frontmatter = before[: before.index("---\n", 4) + 4]
 
-    result = server.write_note("# Plan\n\nnew line", note="Plan", mode="replace")
+    result = server.write_note("# Plan\n\nnew line", note="Plan", mode="replace", expected_revision=server.read_note_snapshot("Plan")["revision"])
 
     assert result["done"] == ("Replaced the text of the existing note 'Plan' at nuru/plan.md (its frontmatter kept; "
                               "the old version is in trash/).")
@@ -2339,7 +2307,7 @@ def test_replace_with_nothing_is_refused(tmp_path, monkeypatch):
     server.create_note(type="topic", title="Plan", author="nuru", body="keep me")
 
     with pytest.raises(ToolError, match="nothing to add.*trash"):
-        server.write_note("", note="Plan", mode="replace")
+        server.write_note("", note="Plan", mode="replace", expected_revision=server.read_note_snapshot("Plan")["revision"])
     assert server.read_note("Plan").endswith("keep me")
 
 
@@ -2465,7 +2433,7 @@ def test_a_replace_keeps_the_old_version_in_trash_where_no_tool_sees_it(tmp_path
     made = server.create_note(type="topic", title="Plan", author="nuru", body="old line")
     old = (tmp_path / made["path"]).read_text()
 
-    server.write_note("# Plan\n\nnew line", note="Plan", mode="replace")
+    server.write_note("# Plan\n\nnew line", note="Plan", mode="replace", expected_revision=server.read_note_snapshot("Plan")["revision"])
 
     [copy] = (tmp_path / "trash" / "nuru").glob("plan.*.md")
     assert copy.read_text() == old
@@ -2477,7 +2445,7 @@ def test_a_replace_with_the_same_text_changes_nothing_and_says_so(tmp_path, monk
     made = server.create_note(type="topic", title="Plan", author="nuru", body="keep me")
     body = (tmp_path / made["path"]).read_text().split("---\n", 2)[2]
 
-    result = server.write_note(body, note="Plan", mode="replace")
+    result = server.write_note(body, note="Plan", mode="replace", expected_revision=server.read_note_snapshot("Plan")["revision"])
 
     assert result["done"].startswith("Nothing changed: the new text for 'Plan'")
     assert not (tmp_path / "trash").exists()

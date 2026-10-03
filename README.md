@@ -4,31 +4,69 @@ An MCP server exposing access to an Obsidian vault: browsing, searching, reading
 
 ## Setup
 
-The server's settings live in `.env.obsidian` in the repo root (see [Settings](../../README.md#settings)). From the root, copy the template and set `VAULT_PATH` to your vault's absolute path:
+Requires Python 3.14.7 or newer and `uv`. Run from this repository:
 
 ```bash
 cp .env.obsidian.example .env.obsidian
-# then edit .env.obsidian
+# Set VAULT_PATH to an existing test vault's absolute path.
+uv sync --locked
+uv run --locked obsidian-mcp
 ```
 
-```
-VAULT_PATH=/absolute/path/to/vault
-```
+Configuration priority is `OBSIDIAN_ENV_FILE`, an existing `.env.obsidian` in the current working directory, then the original Nuru repository-root path (`parents[4]`). For a
+client launched elsewhere, set `VAULT_PATH` directly or set `OBSIDIAN_ENV_FILE`
+to the absolute configuration file path. A GUI client's working directory and
+PATH may differ from your terminal's.
 
-Install dependencies and run:
+The server uses **local stdio**, not a remote authenticated HTTP endpoint. An
+MCP host launches the process and communicates on stdin/stdout. For inspection:
 
 ```bash
-uv sync
-uv run obsidian-mcp
+npx @modelcontextprotocol/inspector uv run --locked obsidian-mcp
 ```
 
-This starts the server over stdio and waits for a host (e.g. Claude Desktop) to connect - see the [servers README](../README.md) for running it, testing it with the MCP Inspector, and access logging.
+Set `OBSIDIAN_READ_ONLY=1` when you want a read-only server. This rejects creation, append, replacement,
+and moves at execution time, while keeping search and reading available. It
+is a server-wide policy, not per-client authorization.
+
+## Mutation safety and limits
+
+- Writes require POSIX (macOS/Linux) because coordination uses `fcntl.flock`.
+  Cooperating writers share a process lock and a persistent
+  `.obsidian-mcp-write.lock` file at the vault root; do not delete it while running. Obsidian and other applications do not acquire it.
+  In writable mode, read tools that consult an existing note index also acquire
+  this lock to reconcile it. Such reads can wait behind writes and create the
+  lock file on their first indexed lookup. Read-only mode uses non-mutating
+  index lookups without this lock.
+- New notes and replacement backups are owner-only (`0600`), independent of
+  umask; existing note permissions are preserved on update.
+- Creation publishes a complete temporary file with a no-clobber hard link.
+  Append and replacement stage and fsync a complete file before atomic replacement,
+  preserve permissions, and recheck the current bytes immediately before commit.
+- Whole-body replacement requires `expected_revision`. First call
+  `read_note(name, include_revision=true)` to obtain `{path, content, revision}`, then pass that
+  revision to `write_note(..., mode="replace", expected_revision=...)`. A stale
+  revision is rejected. Revision reads require an unambiguous name (use an exact path) and cannot
+  select a section; ordinary reads may choose the first alphabetical match.
+  The default `read_note` result remains text. `note_info` also returns the revision.
+- Moves use a no-clobber hard link on the same filesystem and retain the source
+  until the index update succeeds. Directory traversal for mutations refuses
+  symlinks. Cross-filesystem moves are unsupported.
+- Writes run to completion instead of timing out and abandoning a worker that
+  may write later. A stalled filesystem can therefore stall a mutation. A lost
+  client response can still leave its outcome uncertain: inspect before retrying.
+- Replacement keeps an exclusive backup in `trash/`. These operations are not a
+  crash-recovery journal or an atomic transaction across SQLite and the filesystem.
+  External writers can still race after the final revision check; avoid simultaneous
+  edits and do not use a vault controlled by untrusted filesystem writers.
+- Access logs record method, tool name, duration, and error class, but not request
+  parameters, note results, or exception messages. Existing logs are not scrubbed.
 
 ## Dependencies
 
 - **`mcp`** - The MCP server framework this package is built on (`MCPServer`, `@mcp.tool`, `@mcp.resource`); required to expose these tools/resources to a client at all.
 - **`python-dotenv`** - Loads `VAULT_PATH` (and `OBSIDIAN_MCP_LOG_DIR`) from the root's `.env.obsidian` at startup, so the vault location isn't hardcoded or passed as a CLI flag.
-- **`access-logging`** (workspace package, see [servers/tools/logging](../tools/logging)) - Provides `AccessLogMiddleware`, which logs every session's tool/resource access under `.logs/` regardless of which client connects. Shared across servers in this repo rather than reimplemented here.
+- **`access-logging`** (local path dependency, vendored in `vendor/access-logging`) - Provides `AccessLogMiddleware`, which logs every session's tool/resource access under `.logs/` regardless of which client connects. Shared across servers in this repo rather than reimplemented here.
 - **`python-ulid`** - Spec-correct ULID generation for note ids. Chosen over a hand-rolled implementation so the ID format (timestamp + randomness, base32 encoding) is backed by a maintained library instead of custom code.
 - **`pyyaml`** - Serializes a new note's frontmatter, rather than string-templating it, so key ordering, block-style lists, and quoting (e.g. a value starting with `{` being read back as a flow mapping) are handled correctly.
 - **`unidecode`** - Transliterates a title to ASCII before slugifying it, so accented Latin letters and non-Latin scripts (CJK, etc.) survive into the filename as a readable approximation instead of being silently dropped.
@@ -38,13 +76,15 @@ This starts the server over stdio and waits for a host (e.g. Claude Desktop) to 
 
 ## Note model
 
-Notes created by `write_note` are **append-only**: their frontmatter is written exactly once, at creation, and is never rewritten. `id`, `created`, `path`, `tags`, and `aliases` are all server-owned - the caller cannot set them directly. There is no whole-file overwrite (`replace_content`): the only way to change an existing note is `write_note` again, which can only add to the body.
+Frontmatter created by `write_note` is **immutable**: their frontmatter is written exactly once, at creation, and is never rewritten. `id`, `created`, `path`, `tags`, and `aliases` are all server-owned - the caller cannot set them directly. The body can be appended to or replaced through `write_note`; replacement requires a fresh revision and preserves frontmatter.
 
 An index (`.obsidian-mcp-index.sqlite3`, a dotfile inside the vault so it never shows up in `browse`) records `id -> path/type/title/author/created/supersedes` for every note `write_note` has created. It exists to give each note an id and to validate `supersedes` and `targets` without scanning the vault - it only knows about notes `write_note` created, not ones added directly in Obsidian. The file write and the index insert are treated as one operation: if the index insert fails, the just-written file is deleted rather than left as an orphan the index doesn't know about.
 
 The index only learns about a filesystem change through this server's own tools - it has no way to notice the vault changing any other way (Obsidian sync, a git pull, a note deleted directly in the UI, the whole vault cleared out from under it). Left unreconciled, a stale row (its file gone, but its path still `UNIQUE`-constrained) can make a legitimate create collide with a path that no longer exists on disk. So every time the index is opened, it's first reconciled against the current filesystem: any row whose path no longer exists is dropped. There's no separate "startup" hook in this long-running process to do this once, so it runs on every open instead - simple, and correct regardless of when or how the vault changed. `rename_or_move_file` opens (and so reconciles) the index *before* physically moving the file, specifically so reconciliation can't see the old path already gone and delete the row out from under the repoint that's about to happen.
 
 `rename_or_move_file` keeps this index in sync: moving an indexed note - including into `archive/` or `trash/` - repoints its row to the new path (rolling back the move if that repoint fails). Moving a file the index has no row for (an attachment, say) is a no-op on the index, not an error.
+
+The current template version is **0.4.0**; its version history is documented in `frontmatter_template.py`.
 
 The template itself - what fields exist and their allowed values - lives in [`frontmatter_template.py`](src/obsidian_mcp/frontmatter_template.py), separate from `server.py`'s tool logic, and is a plain Python module (not an editable data file) on purpose: the whole point of versioning it is that nothing changes its shape without a code change and a version bump alongside it.
 
@@ -57,11 +97,11 @@ The eleven `type`s a new note can have (`template.TYPE_FOLDER`) each map to a fi
 
 `author` must be one of `user`, `nuru`, `both` (`template.VALID_AUTHORS`). Some types take exactly one extra field (`template.TYPE_FIELD`), passed as its own named parameter: `date` (`daily`), `targets` (`correction`), `session` (`transcript`, `session`) - e.g. `write_note(note="Standup", type="session", ..., session="2026-09-14-01")`. `targets` is required, since only the caller knows what is being corrected. `date` and `session` are not: left out, `date` defaults to today (and `write_note` only ever makes today's daily) and `session` to today's next unused `YYYY-MM-DD-NN` for that type, so a caller doesn't have to state (or get wrong) today's date or work out which session number is free. "Next unused" is one past the highest `NN` any note of that type already has today - not the first gap, so a later session never sorts before an earlier one - and it is counted per type, so a transcript and the session note for the same conversation are both `-01`. The defaults apply only when no extra field was passed at all; a wrong field (a `session` on a `daily`) still fails with an accurate error. "Today" is the server's clock, the same one `created` uses. This is a deliberate loosening of the earlier "exactly the required field must be passed" rule, made because these were the fields a small model most often got wrong or omitted; it changes no note's shape, so `template.VERSION` is unchanged. These are explicit parameters, not `**kwargs`: a `**kwargs` catch-all is exposed in the MCP tool schema as a single required string field no caller can satisfy, which made note creation uncallable through any MCP client until this was fixed.
 
-Every note's frontmatter carries a `version` field, stamped from `template.VERSION` at creation and never touched again. Because notes are append-only, this is the only way to know which frontmatter structure an existing note was written under once that structure changes - so `template.VERSION` gets bumped (semver) whenever `frontmatter_template.py`'s shape changes, or `server.py`'s `_build_frontmatter` output shape changes (a field added/renamed/reordered), but never bumped retroactively: an old note keeps the version number that was current when it was actually written. A future tool that reads notes back can branch on `version` to handle older structures correctly instead of assuming today's shape everywhere.
+Every note's frontmatter carries a `version` field, stamped from `template.VERSION` at creation and never touched again. Because frontmatter is immutable, this is the only way to know which frontmatter structure an existing note was written under once that structure changes - so `template.VERSION` gets bumped (semver) whenever `frontmatter_template.py`'s shape changes, or `server.py`'s `_build_frontmatter` output shape changes (a field added/renamed/reordered), but never bumped retroactively: an old note keeps the version number that was current when it was actually written. A future tool that reads notes back can branch on `version` to handle older structures correctly instead of assuming today's shape everywhere.
 
-`frontmatter_template.py` carries the authoritative definition of what each version number means - a `version` isn't just an incrementing counter, it's a key into that table. **`0.1.0`** (current) means exactly: field order `id, version, type, created, author, supersedes, [<type-specific field>], tags, aliases`; `id` a ULID minted once and never touched again; `created` `"YYYY-MM-DDTHH:mm"` server clock; `author` one of `user`/`nuru`/`both`; `supersedes` an existing note's id or blank; the type-specific field (present only for types in `TYPE_FIELD`) validated per its own rules (`date`: `"YYYY-MM-DD"`; `session`: `"YYYY-MM-DD-NN"`; `targets`: a list of existing note ids); `tags` a block list of `[type, ...extra]` with no tag containing whitespace; `aliases` a block list of `[title, id]`.
+`frontmatter_template.py` carries the authoritative definition of what each version number means - a `version` isn't just an incrementing counter, it's a key into that table. **`0.1.0`** (original) means exactly: field order `id, version, type, created, author, supersedes, [<type-specific field>], tags, aliases`; `id` a ULID minted once and never touched again; `created` `"YYYY-MM-DDTHH:mm"` server clock; `author` one of `user`/`nuru`/`both`; `supersedes` an existing note's id or blank; the type-specific field (present only for types in `TYPE_FIELD`) validated per its own rules (`date`: `"YYYY-MM-DD"`; `session`: `"YYYY-MM-DD-NN"`; `targets`: a list of existing note ids); `tags` a block list of `[type, ...extra]` with no tag containing whitespace; `aliases` a block list of `[title, id]`.
 
-**Not yet implemented** (deferred from the original spec, to keep each change independently reviewable): `read_note` returning ids instead of paths (`search_notes` now returns each hit's id alongside its path, and `read_note` now accepts an id as its `name`). Archive-by-move (replacing a `status: archived` field, which append-only rules out) is `rename_or_move_file(name, "archive")`.
+**Not yet implemented** (deferred from the original spec, to keep each change independently reviewable): `read_note` returning ids instead of paths (`search_notes` now returns each hit's id alongside its path, and `read_note` now accepts an id as its `name`). Archive-by-move (replacing a `status: archived` field, which immutable frontmatter rules out) is `rename_or_move_file(name, "archive")`.
 
 ### Finding, naming and following notes
 
@@ -97,11 +137,13 @@ Which notes count is not left to ripgrep: its `*.md` matches are intersected wit
 
 `search` matches words first and meaning second, and `find_in_notes` matches lines; the meaning half (the internal `semantic_search`) is what makes a question about a "car" find a note about servicing the "automobile". It sits after the exact matches rather than replacing them - an exact id, name, date or number is still a job for the word match or `find_in_notes`. The code is in [`semantic.py`](src/obsidian_mcp/semantic.py).
 
-**How it works.** Each note is split into passage-sized chunks, each chunk is embedded by `nomic-embed-text` v1.5 running in the local Ollama, and the vectors are stored with the chunk's text, the note's path and its id in `.obsidian-mcp-semantic.sqlite3` - a dotfile in the vault, like the note index, so the listing tools never show it. Nothing leaves the machine and nothing secret is stored: only note text and its vectors. v1.5 rather than v2 because v2's 512-token limit would force much smaller chunks. nomic's task prefixes are added for you (`search_document: ` for a chunk, `search_query: ` for a query) - retrieval is noticeably worse without them.
+**How it works.** Each note is split into passage-sized chunks, each chunk is embedded by `nomic-embed-text` v1.5 running in the local Ollama, and the vectors are stored with the chunk's text, the note's path and its id in `.obsidian-mcp-semantic.sqlite3` - a dotfile in the vault, like the note index, so the listing tools never show it. With the default local Ollama endpoint, embeddings stay on the machine. The index stores note text and vectors and must be protected like the vault itself. A configured remote Ollama endpoint receives the text. v1.5 rather than v2 because v2's 512-token limit would force much smaller chunks. nomic's task prefixes are added for you (`search_document: ` for a chunk, `search_query: ` for a query) - retrieval is noticeably worse without them.
 
 **What's indexed.** Every note except `Templates/`, `trash/`, hidden folders and symlinks out of the vault - the same working set `browse` shows, `user/` and `archive/` included. No other folder name is assumed, so the vault can be reorganised freely. A note's id is the one `write_note` gave it, else its frontmatter `id`, else `null`.
 
-**Building the index.** Nuru keeps it current on its own: while Nuru runs, a background thread (see [`vault_indexer.py`](../../nuru/src/core/vault_indexer.py)) looks over the vault every 30 seconds and embeds whatever changed, and the window title reads `Nuru ⠹ indexing 12 notes` while it works - held for at least 1.5 s, then `Nuru · indexed 12 notes` for 3 s, since re-embedding one note takes ~0.1 s. Every pass that changes the index also prints a line to the terminal Nuru was started from (`Nuru: semantic index - indexed 1 note: user/daily-2026-09-17.md`) and adds an `index_pass` event to Nuru's session log under `nuru/logs/`. The first time, that means the whole vault. To build or update it by hand - for another client such as Claude Desktop, or to get the first build out of the way:
+**Building the index.** This standalone server does not run a background
+indexer. Build or refresh it manually after changes, or schedule the command
+outside this process:
 
 ```bash
 ollama pull nomic-embed-text:v1.5   # once
@@ -109,7 +151,7 @@ uv run obsidian-mcp-index            # embeds new and changed notes
 uv run obsidian-mcp-index --rebuild  # starts over - needed after changing either knob below
 ```
 
-Updates are incremental. A note whose modified time hasn't changed isn't read; one whose content hash hasn't changed isn't re-embedded; a deleted or trashed note is dropped. A note moved to another folder keeps its vectors under its new path, unless its title changed too (the title heads every chunk, so a renamed note is re-embedded). Each note's chunks are replaced in one transaction, so a search never sees half a note and an interrupted build resumes where it stopped. The database runs in WAL mode, so the server can search while Nuru writes.
+Updates are incremental. A note whose modified time hasn't changed isn't read; one whose content hash hasn't changed isn't re-embedded; a deleted or trashed note is dropped. A note moved to another folder keeps its vectors under its new path, unless its title changed too (the title heads every chunk, so a renamed note is re-embedded). Each note's chunks are replaced in one transaction, so a search never sees half a note and an interrupted build resumes where it stopped. The database runs in WAL mode, so the server can search while the indexer writes.
 
 **The two knobs to tune** once a first index exists, both set in `.env.obsidian`:
 
@@ -148,9 +190,14 @@ This is a narrow slice of the permission model the original design called for, n
 
 ## Reliability
 
-Both filesystem-mutating tools (`write_note`, `rename_or_move_file`) run their actual disk I/O through a small thread pool with a 10s deadline. If the underlying filesystem call stalls (an unavailable network mount, a stuck disk), the tool raises `TimeoutError` immediately instead of leaving the caller hanging - Python has no safe way to forcibly kill a thread stuck in a blocking syscall, so the abandoned worker thread is left to finish (or never does) rather than cancelled.
+Filesystem mutations run to completion without abandoned timeout workers.
+A stalled filesystem can block the operation; a disconnected client must inspect
+the vault before retrying because its write may have succeeded.
 
-Because of that, creating a note uses an atomic exclusive-create (`open(path, "x")`) rather than a separate exists-check-then-write: a client retrying an identical create after a timeout is safe even if the original, abandoned write is still landing - the two can't silently race and clobber each other, and the retry still correctly fails with `FileExistsError` if a note is already there.
+Creation publishes a fully written temporary file with an exclusive hard link,
+so concurrent creation cannot overwrite an existing note. Mutations are
+serialized and do not abandon worker threads on a timeout; inspect the vault
+before retrying if the client disconnects before confirmation.
 
 ## Error handling
 
@@ -169,11 +216,11 @@ Every tool is wrapped (`@_tool` in `server.py`) so its own anticipated failures 
   - *Exact half* (what the `search_notes` tool was; now internal): Search notes by content, title and filename. `query` is one or more whitespace-separated words: every word must appear (in the note's content, title or filename, in any order, ignoring case). Inside a word, `-` and `_` also match each other and a space, and the parts must sit side by side: `PDP-drop` finds `PDP_drop` and `PDP drop`, and `09-17` finds `2026-09-17` but not a note that merely mentions 09 and 17 separately (written `09 17`, those are two words and may be anywhere) - so date and id searches stay as precise as a literal substring match. Returns `{query, count, matches}` with `matches` holding at most 10 hits, best first (a note with query words in its filename or title ranks above one that only matches in the body; ties are broken by path), each `{path, id, type, title, snippet}`. `count` is the total number of matches, which can exceed 10. `id`/`type`/`title` come from the index, so a note `write_note` didn't create has `null` `id` and `type` (and its filename as `title`) - `write_note` reaches it by path. `snippet` is about 120 characters of the body, frontmatter skipped, around the first hit. A `hint` says how to retry when nothing matches, or how to narrow when results were cut off; a query with no words raises `ValueError`. Returns a dict rather than a bare list so an empty result still reaches the model as a readable message instead of a blank tool response. Only reads the index if it already exists, so searching never creates it.
   - *Meaning half* (what the `semantic_search` tool was; now internal, asked for 10 passages, each cut to 400 characters in `search`'s result): The passages nearest in meaning to `query`, for a question or an idea when you don't know the note's words. `top_k` is at least 1 and capped at 10. Returns `{query, matches}`, best first, each `{path, id, text, score}`: `text` is the chunk (headed `Title > Section`), `score` the cosine similarity (1 is closest), `id` `null` for a note without one. A `hint` explains an empty result. Only reads the index (see *Semantic search*), so a note edited in the last few seconds may still be found by its old text. Raises `FileNotFoundError` if no index has been built, `ValueError` for an empty query or an index built with another model or chunk size, `ConnectionError` if Ollama isn't running. Excludes `Templates/` and `trash/`.
 - **`find_in_notes(pattern)`** - Find the lines of notes matching a regular expression (ripgrep syntax, case-insensitive) - for an exact phrase, id, number or code, where `search_notes` matches words. Returns `{pattern, count, matches}`: at most 10 notes in path order, each `{path, lines: [{line, text}]}` with at most 5 lines (`line` is 1-based; `text` is cut to about 120 characters around the match). `count` is the total number of matching notes, and a `hint` explains an empty or cut-off result. Excludes `Templates/`, `trash/`, hidden folders and symlinks out of the vault; includes `archive/`. An empty pattern or one ripgrep rejects raises `ValueError`; `rg` not being installed raises `FileNotFoundError`. See *Line search* under *Finding, naming and following notes*.
-- **`read_note(name, section=None)`** - Return a note's contents by name: a path, a filename (with or without `.md`), or - forgivingly - a title, alias or id in any case (see *Finding, naming and following notes*). An exact path or filename is tried first, and the first match alphabetically wins if a filename appears in several folders. `section="Heading"` returns just that heading through to the next of the same or higher level; blank or omitted returns the whole note. Raises `FileNotFoundError`, naming the three closest notes, if none matches; `ValueError`, listing the note's headings, if `section` isn't one of them.
-- **`note_info(name)`** - Replaces `get_links` and `note_todos`, and adds the note's tags (as `tags(note=...)`): everything around one note except its text, which stays with `read_note`. The name is resolved once and every part describes that note. Returns `{note, tags, outgoing, backlinks, todos, todo_count, hint}`.
+- **`read_note(name, section=None, include_revision=False)`** - Return a note's contents by name: a path, a filename (with or without `.md`), or - forgivingly - a title, alias or id in any case (see *Finding, naming and following notes*). An exact path or filename is tried first, and the first match alphabetically wins if a filename appears in several folders. `section="Heading"` returns just that heading through to the next of the same or higher level; blank or omitted returns the whole note. `include_revision=True` returns `{path, content, revision}`, requires an unambiguous name (pass an exact path), and refuses a section selection. Unlike an ordinary read, it never picks the first of several matching notes. Raises `FileNotFoundError`, naming the three closest notes, if none matches; `ValueError`, listing the note's headings, if `section` isn't one of them.
+- **`note_info(name)`** - Replaces `get_links` and `note_todos`, and adds the note's tags (as `tags(note=...)`): everything around one note except its text, which stays with `read_note`. The name is resolved once and every part describes that note. Returns `{note, revision, tags, outgoing, backlinks, todos, todo_count, hint}`.
   - *Links* (was `get_links`): A note's outgoing `[[wikilinks]]` resolved to paths (`null` where no note has that name) and its backlinks. Returns `{note, outgoing, backlinks}`, each list capped at 25.
   - *Open tasks* (was `note_todos`): One note's open tasks: every unticked checkbox (`- [ ]`, `* [ ]`, `1. [ ]`) and every line containing `TODO`, with 1-based line numbers. Ticked `[x]` items, frontmatter and fenced code blocks are skipped. Returns `{note, count, todos: [{line, text}]}`, at most 25, with a `hint` for an empty or cut-off result.
-- **`write_note(content="", note=None, mode="append", type=None, author=None, tags=None, supersedes=None, targets=None, session=None)`** - Write to a note, creating it first if it doesn't exist (see *Writing: `write_note`*). `type="daily"` is Nuru's own daily note for today, in `nuru/`. Otherwise `note` is an existing note's path, title or id; or, for a new note, a title (it goes in `nuru/`) or a path under `nuru/` or `shared/` such as `nuru/People/Dana Lee` (folders are made as needed). A new note may be empty; `type` defaults to `topic` (the description lists what each type is for, from `TYPE_DESCRIPTIONS`) and `author` to `nuru`. A type given for an existing note is ignored, except `correction`, which is refused. A new note whose name is all but an existing one's (`_near_names`; names differing only in digits don't count) is refused with "did you mean". An append whose content contains the note's own text is refused, pointing at `mode="replace"`. `mode="append"` (the default) adds `content` to the end, with a blank line before it; `mode="replace"` makes `content` the note's whole text after its frontmatter, which is kept - the one way to change existing text, so every guard applies to it too. On Nuru's server only notes in `nuru/` can be replaced; the version a replace overwrites is copied to `trash/<path>.<timestamp>.md` first (invisible to every tool, recoverable in Obsidian); text identical to the note's changes nothing and `done` says so; replacing with nothing is refused (a delete is a move to trash). Creating validates as the Note model describes. Refuses an ambiguous `note`, a path or id that matches nothing, creation-only arguments on an existing note, an archived note, and - on Nuru's server - anything under `user/` and any note the user wrote. A correction (`type="correction"`) needs no `targets`: if left out they are taken from the `[[links]]` in its content, and one that links no note is refused. Returns `{done, path, id, created}`: `done` is one sentence naming the note, its path and what was done.
+- **`write_note(content="", note=None, mode="append", type=None, author=None, tags=None, supersedes=None, targets=None, session=None, expected_revision=None)`** - Write to a note, creating it first if it doesn't exist (see *Writing: `write_note`*). `type="daily"` is Nuru's own daily note for today, in `nuru/`. Otherwise `note` is an existing note's path, title or id; or, for a new note, a title (it goes in `nuru/`) or a path under `nuru/` or `shared/` such as `nuru/People/Dana Lee` (folders are made as needed). A new note may be empty; `type` defaults to `topic` (the description lists what each type is for, from `TYPE_DESCRIPTIONS`) and `author` to `nuru`. A type given for an existing note is ignored, except `correction`, which is refused. A new note whose name is all but an existing one's (`_near_names`; names differing only in digits don't count) is refused with "did you mean". An append whose content contains the note's own text is refused, pointing at `mode="replace"`. `mode="append"` (the default) adds `content` to the end, with a blank line before it; `mode="replace"` makes `content` the note's whole text after its frontmatter, which is kept - the one way to change existing text, requiring `expected_revision` from `read_note(include_revision=true)`, so every guard applies to it too. On Nuru's server only notes in `nuru/` can be replaced; the version a replace overwrites is copied to `trash/<path>.<timestamp>.md` first (invisible to every tool, recoverable in Obsidian); text identical to the note's changes nothing and `done` says so; replacing with nothing is refused (a delete is a move to trash). Creating validates as the Note model describes. Refuses an ambiguous `note`, a path or id that matches nothing, creation-only arguments on an existing note, an archived note, and - on Nuru's server - anything under `user/` and any note the user wrote. A correction (`type="correction"`) needs no `targets`: if left out they are taken from the `[[links]]` in its content, and one that links no note is refused. Returns `{done, path, id, created}`: `done` is one sentence naming the note, its path and what was done.
 - **`rename_or_move_file(source_path, destination_path)`** - Move a file, repointing its index row if it's an indexed note (see Note model above). `source_path` is a vault-relative path or, for a note, any name `read_note` accepts (a name matching several notes is refused). `destination_path` is the new vault-relative path, or just `archive` or `trash` to move it there under its own folder path (see *Archive and trash*). Returns `{from, to}`. Raises `FileNotFoundError` if the source doesn't exist, `FileExistsError` if the destination already does, `ValueError` for a note already archived, or `PermissionError` for a source in `trash/`, a path that is hidden (e.g. `.obsidian/`) or under `user/`, or a user-written note when that protection is on (see Permissions above).
 
 Not implemented: patching content near a heading, block reference, or frontmatter field (an atomic/surgical insert) was judged too complex to safely review and ship alongside the tools above.
@@ -188,7 +235,7 @@ The same tag data is also available through the `tags` tool, which is what a cli
 ## Testing
 
 ```bash
-uv run pytest
+VAULT_PATH=/tmp/test-vault uv run --locked pytest tests vendor/access-logging/tests
 ```
 
 The semantic search tests use a stand-in embedder, so they need neither Ollama nor the model. One test checks the real `nomic-embed-text:v1.5` against the same small fixture vault, and it's skipped unless you ask for it:
@@ -197,4 +244,9 @@ The semantic search tests use a stand-in embedder, so they need neither Ollama n
 OBSIDIAN_SEMANTIC_LIVE=1 uv run pytest tests/test_semantic.py -k nomic
 ```
 
-See the [servers README](../README.md) for running the whole repo's tests together from the root.
+Tests use temporary vaults. The live embedding test requires local Ollama and the model; ordinary tests use a stand-in embedder.
+
+## Development records
+
+Implementation decisions and verification results are in the append-only
+[development log](docs/development-log.md).

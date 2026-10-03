@@ -40,7 +40,18 @@ from dotenv import load_dotenv
 from obsidian_mcp import index as note_index
 
 # The obsidian server's settings (VAULT_PATH, ...) live in the repo root's .env.obsidian.
-ENV_FILE = Path(__file__).resolve().parents[4] / ".env.obsidian"
+def _env_file() -> Path:
+    explicit = os.environ.get("OBSIDIAN_ENV_FILE")
+    if explicit:
+        return Path(explicit).expanduser()
+    local = Path.cwd() / ".env.obsidian"
+    if local.is_file():
+        return local
+    # Compatibility with Nuru's <repo>/servers/obsidian/src/package layout.
+    return Path(__file__).resolve().parents[4] / ".env.obsidian"
+
+
+ENV_FILE = _env_file()
 
 # v1.5, not v2: v1.5 takes a whole passage (Ollama serves it with num_ctx 8192) where
 # v2's 512-token limit would force much smaller chunks. The tag is explicit because

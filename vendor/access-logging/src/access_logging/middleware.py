@@ -147,7 +147,7 @@ class AccessLogMiddleware(ServerMiddleware[Any]):
                 "event": "request",
                 "method": ctx.method,
                 "tool_name": tool_name,
-                "params": ctx.params,
+                "params": None,  # Arguments may contain private notes or credentials.
             }
         )
         start = monotonic()
@@ -163,7 +163,7 @@ class AccessLogMiddleware(ServerMiddleware[Any]):
                     "method": ctx.method,
                     "tool_name": tool_name,
                     "status": "error",
-                    "error": str(e),
+                    "error": type(e).__name__,
                     "usage": None,
                     "duration_ms": round((monotonic() - start) * 1000, 3),
                 }
