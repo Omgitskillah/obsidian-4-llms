@@ -13,6 +13,11 @@ _LOCK = threading.RLock()
 _LOCAL = threading.local()
 
 
+def started() -> bool:
+    """Whether this coordinated operation may have changed a vault path."""
+    return getattr(_LOCAL, "started", False)
+
+
 def revision(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -30,6 +35,7 @@ def coordinate(root: Path) -> Iterator[None]:
                 raise ValueError("Mutation lock is not a regular file")
             fcntl.flock(fd, fcntl.LOCK_EX)
             _LOCAL.active = True
+            _LOCAL.started = False
             try:
                 yield
             finally:
@@ -91,6 +97,7 @@ def _stage(fd: int, data: bytes, mode: int) -> str:
 
 
 def create(root: Path, path: Path, data: bytes) -> None:
+    _LOCAL.started = True
     with parent(root, path, create=True) as (fd, name):
         temp = _stage(fd, data, 0o600)
         try:
@@ -101,6 +108,7 @@ def create(root: Path, path: Path, data: bytes) -> None:
 
 
 def update(root: Path, path: Path, before: bytes, after: bytes) -> None:
+    _LOCAL.started = True
     with parent(root, path) as (fd, name):
         current, mode = _read(fd, name)
         if current != before:
@@ -118,6 +126,7 @@ def update(root: Path, path: Path, before: bytes, after: bytes) -> None:
 
 
 def remove(root: Path, path: Path, expected: bytes) -> None:
+    _LOCAL.started = True
     with parent(root, path) as (fd, name):
         if _read(fd, name)[0] != expected:
             raise ValueError("Recovery refused: file changed")
@@ -127,6 +136,7 @@ def remove(root: Path, path: Path, expected: bytes) -> None:
 @contextlib.contextmanager
 def move(root: Path, source: Path, destination: Path) -> Iterator[None]:
     """No-clobber same-filesystem move, keeping source until index update succeeds."""
+    _LOCAL.started = True
     with parent(root, source) as (src_fd, src), parent(root, destination, create=True) as (dst_fd, dst):
         before, _ = _read(src_fd, src)
         os.link(src, dst, src_dir_fd=src_fd, dst_dir_fd=dst_fd, follow_symlinks=False)

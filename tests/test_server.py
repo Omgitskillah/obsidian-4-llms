@@ -837,8 +837,9 @@ def test_create_note_preserves_unicode_in_aliases(tmp_path, monkeypatch):
 def test_create_note_rejects_a_user_folder_type_with_a_non_user_author(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "VAULT_PATH", tmp_path)
 
-    with pytest.raises(ToolError, match='only author="user" may create'):
+    with pytest.raises(ToolError) as caught:
         server.create_note(type="directives", title="X", author="nuru")
+    assert 'only author="user" may create' in json.loads(str(caught.value))['message']
 
 
 def test_create_note_accepts_a_user_folder_type_with_author_user(tmp_path, monkeypatch):
@@ -2360,8 +2361,9 @@ def test_a_move_says_what_happened(tmp_path, monkeypatch):
 def test_a_missing_note_says_how_to_name_one(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "VAULT_PATH", tmp_path)
 
-    with pytest.raises(ToolError, match='note is missing - pass note="<a short title>"'):
+    with pytest.raises(ToolError) as caught:
         server.write_note("Flights: 400 EUR", type="topic", author="nuru")
+    assert 'note is missing - pass note="<a short title>"' in json.loads(str(caught.value))['message']
 
 
 # --- write_note: free paths under nuru/ and shared/, and the guards that come with them ---
@@ -2408,9 +2410,10 @@ def test_an_append_that_repeats_the_note_is_refused(tmp_path, monkeypatch):
                               body="First snippet explains the ring buffer.\n\nSecond snippet is the ISR.")
     before = (tmp_path / made["path"]).read_text()
 
-    with pytest.raises(ToolError, match='mode="replace" and the complete new text'):
+    with pytest.raises(ToolError) as caught:
         server.write_note("# Snippets\n\nFirst snippet explains the ring buffer.\n\nSecond snippet is the ISR.\n\nNew line",
                           note="Snippets")
+    assert 'mode="replace" and the complete new text' in json.loads(str(caught.value))['message']
     assert (tmp_path / made["path"]).read_text() == before
     assert server.write_note("New line", note="Snippets")["created"] is False
 
