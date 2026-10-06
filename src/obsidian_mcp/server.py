@@ -140,13 +140,22 @@ _T = TypeVar("_T")
 
 
 def _mutation(fn: Callable[..., _T]) -> Callable[..., _T]:
+    def rejected(error: Exception) -> ToolError:
+        return ToolError(json.dumps({"code": "REJECTED_BEFORE_WRITE", "completion_certainty": "not_completed",
+                                     "message": f"{type(error).__name__}: {error}"}))
+
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> _T:
         if os.environ.get("OBSIDIAN_READ_ONLY") == "1":
-            raise PermissionError("Read-only mode: vault mutations are disabled")
+            raise rejected(PermissionError("Read-only mode: vault mutations are disabled"))
         # Run to completion. A timeout must not leave an abandoned writer behind.
         with mutations.coordinate(VAULT_PATH):
-            return fn(*args, **kwargs)
+            try:
+                return fn(*args, **kwargs)
+            except _ANTICIPATED_ERRORS as error:
+                if not mutations.started():
+                    raise rejected(error) from error
+                raise
     return wrapper
 
 

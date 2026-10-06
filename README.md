@@ -250,3 +250,17 @@ Tests use temporary vaults. The live embedding test requires local Ollama and th
 
 Implementation decisions and verification results are in the append-only
 [development log](docs/development-log.md).
+
+### Mutation rejection receipts
+
+Anticipated validation/refusal errors raised before any mutation helper starts carry
+an explicit JSON ToolError receipt: `code: REJECTED_BEFORE_WRITE`,
+`completion_certainty: not_completed`, and a human-readable `message`. The MCP SDK
+may prefix this with `Error executing tool <name>:`. Clients can correct these
+requests without replaying a partially completed mutation.
+
+Once create/update/remove/move has started, including staging, backup creation or
+rollback, errors retain their usual diagnostic form and **do not** receive that
+receipt. Exception names such as ValueError or PermissionError alone do not prove
+non-completion. This conservative signal does not provide idempotency keys or
+exactly-once execution. Lost responses still need reconciliation.

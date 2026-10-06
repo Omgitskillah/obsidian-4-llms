@@ -200,3 +200,57 @@ def test_symlinked_index_cannot_modify_outside_database(vault, monkeypatch):
         server.write_note("new", note="Other")
     assert outside.read_bytes() == before
     assert not (vault / "nuru/other.md").exists()
+
+
+@pytest.mark.parametrize('operation', [
+    lambda: server.write_note('new'),
+    lambda: server.write_note('new', note='Plan', mode='replace'),
+    lambda: server.write_note('new', note='Plan', mode='replace', expected_revision='stale'),
+    lambda: server.write_note('new', note='Plan', type='correction'),
+    lambda: server.rename_or_move_file('nuru/plan.md', 'nuru/plan.md'),
+    lambda: server.create_note(type='correction', title='Fix', author='nuru'),
+])
+def test_pre_mutation_refusals_have_an_explicit_receipt(vault, operation):
+    import json
+    before = {p.relative_to(vault): p.read_bytes() for p in vault.rglob('*.md')}
+    with pytest.raises(ToolError) as caught:
+        operation()
+    receipt = json.loads(str(caught.value))
+    assert receipt['code'] == 'REJECTED_BEFORE_WRITE'
+    assert receipt['completion_certainty'] == 'not_completed'
+    assert {p.relative_to(vault): p.read_bytes() for p in vault.rglob('*.md')} == before
+
+
+def test_post_update_permission_error_is_not_a_prewrite_rejection(vault, monkeypatch):
+    original = mutations.update
+    def update(*args):
+        original(*args)
+        raise PermissionError('receipt cleanup failed')
+    monkeypatch.setattr(mutations, 'update', update)
+    with pytest.raises(ToolError, match='PermissionError: receipt cleanup failed') as caught:
+        server.write_note('published', note='Plan')
+    assert 'REJECTED_BEFORE_WRITE' not in str(caught.value)
+    assert server.read_note('Plan').endswith('published')
+
+
+def test_replace_failure_after_backup_creation_is_not_a_prewrite_rejection(vault, monkeypatch):
+    snapshot = server.read_note_snapshot('Plan')
+    def fail(*args):
+        raise ValueError('target changed before update')
+    monkeypatch.setattr(mutations, 'update', fail)
+    with pytest.raises(ToolError, match='target changed') as caught:
+        server.write_note('replacement', note='Plan', mode='replace', expected_revision=snapshot['revision'])
+    assert 'REJECTED_BEFORE_WRITE' not in str(caught.value)
+    assert list((vault / 'trash').rglob('*.md'))
+
+
+def test_move_recovery_refusal_is_not_a_prewrite_rejection(vault, monkeypatch):
+    destination = vault / 'nuru/moved.md'
+    def update(*args):
+        destination.write_text('edited during move')
+        raise ValueError('index update failed')
+    monkeypatch.setattr(server.note_index, 'update_path', update)
+    with pytest.raises(ToolError, match='Move recovery refused') as caught:
+        server.rename_or_move_file('nuru/plan.md', 'nuru/moved.md')
+    assert 'REJECTED_BEFORE_WRITE' not in str(caught.value)
+    assert destination.exists() and (vault / 'nuru/plan.md').exists()
