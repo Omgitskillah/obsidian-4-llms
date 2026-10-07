@@ -1,5 +1,7 @@
 # obsidian-mcp
 
+Read-only vault bookkeeping: [link integrity audit](docs/link-integrity.md) supports a model-free CLI and the `audit_links` MCP tool.
+
 An MCP server exposing access to an Obsidian vault: browsing, searching, reading, and writing notes, plus tag data and the link graph.
 
 ## Setup
