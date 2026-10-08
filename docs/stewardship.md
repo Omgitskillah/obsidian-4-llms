@@ -67,3 +67,22 @@ mirrors cite all sources. Newest text is not chosen as truth; prose completion i
 not inferred. `[repeat:...]` is retained and queued for review, with no invented
 future recurrence. Reopening is represented by an open checkbox, not guessed from
 prose. IDs without explicit task markers are occurrence-local.
+
+## Structured tables (WP09.1)
+
+`steward_tables.tables(snapshot, configs)` parses Markdown-it pipe tables with
+declared column names, literal unit/currency suffixes/prefixes, and dot/comma
+decimal separators. Thousands separators are not guessed. Number/date/string
+columns distinguish required blanks, zero, invalid, and explicitly declared `na`
+strings. Malformed widths and unmatched tables are coverage diagnostics; they do
+not yield fabricated arithmetic. Pipes in cells must be escaped, including inside
+code spans. Formula strings and plugin code remain inert data.
+
+Schema keys: `name`, optional `glob`, `columns`, optional `unique_by`, `totals`,
+`formulas`. A total specifies `label_column`, `label`, numerical `column`, and
+nonnegative decimal `tolerance`; exactly one total row is required. Unresolved
+input cells prevent computing a total. Formulas explicitly name numeric `left`,
+`right`, `result`, and `op` (add/multiply), with optional tolerance. All arithmetic
+uses Decimal. Reports retain raw input rows/lines and revisions, never overwrite
+cells. No exchange-rate lookup, arbitrary expression evaluator, locale inference,
+or prose extraction is provided.
