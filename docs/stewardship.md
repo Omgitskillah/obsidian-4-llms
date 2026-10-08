@@ -50,3 +50,20 @@ diagnosed. Unrecognized plugin sources and excluded notes remain a coverage gap.
 Unreferenced assets have **unknown ownership**, never deletion eligibility. Reports
 never delete, quarantine, merge, or update references. Potential duplicate bytes
 are opportunities, not reclaimed space. Vision/similarity inference remains off.
+
+## Task ledger (WP04.1)
+
+`tasks(snapshot, as_of="2026-10-08", timezone="Europe/Berlin")` requires a real
+ISO date and valid IANA timezone. `as_of` is the explicitly chosen local calendar
+date; the machine clock is never consulted. Supported list checkboxes are space
+(open), x/X (completed), - (canceled), / (in progress). Due dates use
+`[due:YYYY-MM-DD]` or `📅 YYYY-MM-DD`. Undated tasks are not overdue. Examples in
+code, comments and quoted lines are excluded. Invalid dates/statuses are reported.
+
+Mirrors require `[task:ID]` and an explicit frontmatter `project`. Different
+projects never share an identity. `task_record: historical` retains an occurrence
+but excludes it from overdue/conflict checks. Conflicting active status/deadline
+mirrors cite all sources. Newest text is not chosen as truth; prose completion is
+not inferred. `[repeat:...]` is retained and queued for review, with no invented
+future recurrence. Reopening is represented by an open checkbox, not guessed from
+prose. IDs without explicit task markers are occurrence-local.

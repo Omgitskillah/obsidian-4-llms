@@ -15,6 +15,7 @@ from pathlib import Path
 import re
 import stat
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from markdown_it import MarkdownIt
 import yaml
@@ -357,3 +358,58 @@ def attachments(snapshot: Snapshot, *, large_bytes: int = 100 * 1024 * 1024,
                            potential_duplicate_bytes=sum(g['potential_duplicate_bytes'] for g in groups),
                            coverage_warning='Unrecognized plugin references and excluded sources can own assets; no deletion eligibility is asserted.',
                            complete=not diagnostics, diagnostics=diagnostics)
+
+
+def tasks(snapshot: Snapshot, *, as_of: str, timezone: str = 'UTC') -> dict:
+    """Task occurrences; only explicit IDs within an explicit project are mirrors."""
+    if not valid_date(as_of):
+        raise ValueError('as_of must be an ISO date')
+    ZoneInfo(timezone)  # Declared local calendar date, not machine wall clock.
+    today = date.fromisoformat(as_of)
+    ledger, findings, mirrors = [], [], {}
+    for doc in snapshot.documents.values():
+        if doc.issues:
+            continue
+        counts = Counter()
+        project = doc.properties.get('project')
+        historical = doc.properties.get('task_record') == 'historical'
+        for line_no, line in body_lines(doc):
+            match = re.match(r'^\s*(?:[-*+]|\d+[.)])\s+\[([^\]])\]\s+(.*)', line)
+            if not match:
+                continue
+            mark, text = match.groups()
+            if mark.lower() not in {' ', 'x', '-', '/'}:
+                findings.append(finding(doc, 'task.unsupported_status', str(line_no), line, line=line_no))
+                continue
+            status = {' ': 'open', 'x': 'completed', '-': 'canceled', '/': 'in_progress'}[mark.lower()]
+            id_match = re.search(r'\[task:([\w.-]+)\]', text)
+            due_match = re.search(r'(?:\[due:([^\]]+)\]|📅\s*(\S+))', text)
+            due = (due_match.group(1) or due_match.group(2)).strip() if due_match else None
+            repeat = re.search(r'\[repeat:([^\]]+)\]', text)
+            counts[text] += 1
+            identity = f'{project}:{id_match[1]}' if id_match and isinstance(project, str) and project else None
+            key = id_match[1] if id_match else f'{text}:{counts[text]}'
+            occurrence = {'source': doc.path, 'line': line_no, 'revision': doc.revision,
+                          'occurrence_id': digest(f'{doc.path}\0{key}'.encode()),
+                          'identity': identity, 'project': project, 'text': text, 'status': status,
+                          'due': due, 'recurrence': repeat[1] if repeat else None, 'historical': historical,
+                          'overdue': bool(not historical and status in {'open', 'in_progress'} and due
+                                          and valid_date(due) and date.fromisoformat(due) < today)}
+            ledger.append(occurrence)
+            if due and not valid_date(due):
+                findings.append(finding(doc, 'task.invalid_due', key, occurrence, line=line_no, severity='defect'))
+            if occurrence['overdue']:
+                findings.append(finding(doc, 'task.overdue', key, occurrence, line=line_no))
+            if repeat:
+                findings.append(finding(doc, 'task.recurrence_review', key, occurrence, line=line_no,
+                                        action='Review explicit recurrence; no future occurrence is inferred'))
+            if identity and not historical:
+                mirrors.setdefault(identity, []).append(occurrence)
+    for identity, rows in mirrors.items():
+        if len({(r['status'], r['due']) for r in rows}) > 1:
+            for row in rows:
+                doc = snapshot.documents[row['source']]
+                findings.append(finding(doc, 'task.mirror_conflict', identity, {'identity': identity, 'occurrences': rows},
+                                        line=row['line'], action='Compare active mirrors; do not infer completion from prose'))
+    return snapshot.report(findings, tasks=ledger, as_of=as_of, timezone=timezone,
+                           coverage_warning='Only declared checkbox syntax and explicit project-scoped task IDs are reconciled. Recurrence and prose completion require review.')
