@@ -219,3 +219,28 @@ sidecar review and never edits notes. The `audit_stewardship` MCP tool reads
 `OBSIDIAN_STEWARD_CONFIG`; it does not write sidecar state, and is not added to
 Nuru's default model tool allowlist. No inferred repairs, moves, merges, or deletes
 are performed by any package.
+
+## Optional interpretation boundary
+
+`steward_interpretation.candidates` freezes an explicitly selected request queue
+with 1..4 eligible notes/candidate, bounded excerpts, exact revisions, and same
+declared scope for cross-note comparisons. `interpret` accepts an injected
+provider and rendered-chat token counter. Without a per-run `RunApproval` it
+refuses to call the provider. A live approval must be obtained from the human
+before constructing it; the record is an application attestation, not an external
+authorization service. No built-in provider, automatic inference scheduling,
+environment bypass, or live CLI invocation is added.
+
+Each call reserves counted input + capped output against the total run budget,
+including failed calls. Live adapters must return `InferenceResponse` with exact
+model revision and measured usage. Budget mismatches stop the run. Results record
+calls, tokens, latency, unprocessed candidates, and invalid responses. Yield can
+pause before a call. Failed requests are not retried silently.
+
+Format, verbatim citations, and unchanged source revisions are validated in code.
+Passing those checks does **not** prove semantic correctness: every suggestion
+still requires human semantic review; no automatic action is permitted. Feature
+question selection, provider integration, exact tokenizer/chat template, and
+model-quality grading remain separately configured work. Fake-provider tests do
+not demonstrate prompt-injection resistance or model efficacy. All live stages
+remain OFF and NOT RUN pending per-run permission.
