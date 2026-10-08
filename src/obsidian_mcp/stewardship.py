@@ -13,13 +13,14 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 from typing import Any
 
 from markdown_it import MarkdownIt
 import yaml
 
 from obsidian_mcp import mutations
-from obsidian_mcp.link_integrity import Policy, _comments
+from obsidian_mcp.link_integrity import Policy, LinkIndex, Reference, parse_note, _comments
 
 
 class PropertyLoader(yaml.SafeLoader):
@@ -34,6 +35,24 @@ PropertyLoader.yaml_implicit_resolvers = {
 
 def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def asset_hash(root: Path, path: Path) -> tuple[str, int]:
+    """Hash regular assets in 1 MiB chunks through symlink-safe descriptors."""
+    with mutations.parent(root, path) as (fd, name):
+        file_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+        with os.fdopen(file_fd, 'rb') as file:
+            before = os.fstat(file.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise ValueError('not_regular_file')
+            result, size = hashlib.sha256(), 0
+            while chunk := file.read(1024 * 1024):
+                size += len(chunk)
+                result.update(chunk)
+            after = os.fstat(file.fileno())
+            if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+                raise ValueError('changed_during_read')
+            return result.hexdigest(), size
 
 
 @dataclass(frozen=True)
@@ -125,6 +144,10 @@ class Snapshot:
                     if path.is_symlink():
                         raise ValueError('symlink_not_scanned')
                     before = path.lstat()
+                    if path.suffix.lower() != '.md':
+                        assets[rel] = asset_hash(self.root, path)
+                        bytes_read += assets[rel][1]
+                        continue
                     data = mutations.read(self.root, path)
                     after = path.lstat()
                     bytes_read += len(data)
@@ -271,3 +294,66 @@ def properties(snapshot: Snapshot, schemas: list[dict]) -> dict:
                     findings.append(finding(doc, 'property.cross_field', json.dumps(rule, sort_keys=True),
                                             {'rule': rule, 'left': left, 'right': right}, severity='defect'))
     return snapshot.report(findings, schemas=[s['name'] for s in schemas])
+
+
+def attachments(snapshot: Snapshot, *, large_bytes: int = 100 * 1024 * 1024,
+                reference_properties: tuple[str, ...] = ()) -> dict:
+    """Inventory exact bytes and known ownership; never declares deletion safe."""
+    if type(large_bytes) is not int or large_bytes <= 0:
+        raise ValueError('large_bytes must be a positive integer')
+    index = LinkIndex(snapshot.root, snapshot.policy)
+    index.report(include_resolved=True)
+    owners: dict[str, list[dict]] = {p: [] for p in snapshot.assets}
+    findings = []
+    diagnostics = list(snapshot.diagnostics) + index.diagnostics
+    for row in index.results:
+        if row.get('path') in owners:
+            owners[row['path']].append({'source': row['source'], 'line': row['line'], 'syntax': row['syntax']})
+        if row['status'] == 'broken' and row.get('embed'):
+            doc = snapshot.documents.get(row['source'])
+            if doc:
+                findings.append(finding(doc, 'attachment.missing_embed', row['finding_id'], row, line=row['line'], severity='defect'))
+    for doc in snapshot.documents.values():
+        for key in reference_properties:
+            value = doc.properties.get(key, [])
+            for raw in value if isinstance(value, list) else [value]:
+                if not isinstance(raw, str):
+                    continue
+                refs = parse_note(raw.encode()).references
+                if not refs:
+                    refs = [Reference(1, raw, raw, 'wiki', True)]
+                for ref in refs:
+                    result = index._resolve(doc.path, ref)
+                    if result.get('path') in owners:
+                        owners[result['path']].append({'source': doc.path, 'line': doc.locations[key], 'syntax': 'property', 'property': key})
+    for path in snapshot.assets:
+        if not path.endswith('.canvas'):
+            continue
+        try:
+            if snapshot.assets[path][1] > 16 * 1024 * 1024:
+                raise ValueError('canvas_too_large')
+            canvas = json.loads(mutations.read(snapshot.root, snapshot.root / path))
+            if not isinstance(canvas, dict) or not isinstance(canvas.get('nodes', []), list):
+                raise ValueError('invalid_canvas')
+            for node in canvas.get('nodes', []):
+                if not isinstance(node, dict):
+                    raise ValueError('invalid_canvas_node')
+                if node.get('type') == 'file' and isinstance(node.get('file'), str):
+                    result = index._resolve(path, Reference(1, node['file'], '/' + node['file'].lstrip('/'), 'wiki', True))
+                    if result.get('path') in owners:
+                        owners[result['path']].append({'source': path, 'node': node.get('id'), 'syntax': 'canvas'})
+        except (OSError, ValueError, TypeError) as exc:
+            diagnostics.append({'path': path, 'reason': str(exc)})
+    grouped = {}
+    for path, (hash_, size) in snapshot.assets.items():
+        grouped.setdefault(hash_, []).append(path)
+    groups = [{'sha256': h, 'paths': sorted(paths), 'potential_duplicate_bytes': snapshot.assets[paths[0]][1] * (len(paths) - 1)}
+              for h, paths in sorted(grouped.items()) if len(paths) > 1]
+    inventory = [{'path': path, 'revision': hash_, 'bytes': size, 'large': size >= large_bytes,
+                  'owners': owners[path], 'ownership': 'referenced' if owners[path] else 'unknown',
+                  'deletion_eligible': False}
+                 for path, (hash_, size) in sorted(snapshot.assets.items())]
+    return snapshot.report(findings, inventory=inventory, duplicate_groups=groups,
+                           potential_duplicate_bytes=sum(g['potential_duplicate_bytes'] for g in groups),
+                           coverage_warning='Unrecognized plugin references and excluded sources can own assets; no deletion eligibility is asserted.',
+                           complete=not diagnostics, diagnostics=diagnostics)

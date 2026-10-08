@@ -35,3 +35,18 @@ action, and counts. `complete` reports scan diagnostics, not semantic coverage.
 IDs derive from path/rule/entity; renames change IDs until the lifecycle milestone.
 No inference has been implemented or invoked by the property validator. The
 initial API is a Python backend; CLI/MCP integration is a later shared milestone.
+
+## Attachment inventory (WP03.1)
+
+`attachments(snapshot, large_bytes=..., reference_properties=(...))` returns asset
+sizes, SHA-256 revisions, exact duplicate groups, potential duplicate bytes counted
+once per group, and known owners. Assets hash in 1 MiB chunks with one reader;
+there is no full-asset buffering or hashing concurrency. No-change reconciliation
+rehashes assets for correctness; a persistent trusted hash cache is not yet built.
+
+Ownership uses WP02 body links, explicitly declared frontmatter reference fields,
+and Canvas `type:file` nodes. Canvas files over 16 MiB or malformed nodes are
+diagnosed. Unrecognized plugin sources and excluded notes remain a coverage gap.
+Unreferenced assets have **unknown ownership**, never deletion eligibility. Reports
+never delete, quarantine, merge, or update references. Potential duplicate bytes
+are opportunities, not reclaimed space. Vision/similarity inference remains off.
