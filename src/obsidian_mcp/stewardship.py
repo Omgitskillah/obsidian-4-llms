@@ -72,7 +72,7 @@ class Document:
 
 
 def parse_document(path: str, data: bytes) -> Document:
-    text = data.decode('utf-8')
+    text = data.decode('utf-8-sig')
     properties, locations, issues = {}, {}, []
     body = text
     lines = text.splitlines(keepends=True)
@@ -95,6 +95,16 @@ def parse_document(path: str, data: bytes) -> Document:
                     if len(visited) > 10000:
                         raise ValueError('Frontmatter exceeds 10000 nodes')
                     if isinstance(current, yaml.MappingNode):
+                        nested_seen = set()
+                        if current is not node:
+                            for key, value in current.value:
+                                if not isinstance(key, yaml.ScalarNode):
+                                    raise ValueError('Nested property keys must be scalar strings')
+                                if key.value in nested_seen:
+                                    issues.append({'line': key.start_mark.line + 2, 'rule': 'frontmatter.duplicate', 'evidence': key.value})
+                                nested_seen.add(key.value)
+                                if key.value == '<<':
+                                    raise ValueError('YAML merge keys are unsupported')
                         pending.extend(n for pair in current.value for n in pair)
                     elif isinstance(current, yaml.SequenceNode):
                         pending.extend(current.value)
@@ -411,6 +421,7 @@ def tasks(snapshot: Snapshot, *, as_of: str, timezone: str = 'UTC') -> dict:
         if doc.issues:
             continue
         counts = Counter()
+        key_counts = Counter()
         project = doc.properties.get('project')
         historical = doc.properties.get('task_record') == 'historical'
         for line_no, line in body_lines(doc):
@@ -429,8 +440,11 @@ def tasks(snapshot: Snapshot, *, as_of: str, timezone: str = 'UTC') -> dict:
             counts[text] += 1
             identity = f'{project}:{id_match[1]}' if id_match and isinstance(project, str) and project else None
             key = id_match[1] if id_match else f'{text}:{counts[text]}'
+            key_counts[key] += 1
+            key = f'{key}:{key_counts[key]}'
             occurrence = {'source': doc.path, 'line': line_no, 'revision': doc.revision,
                           'occurrence_id': digest(f'{doc.path}\0{key}'.encode()),
+                          'entity_key': key,
                           'identity': identity, 'project': project, 'text': text, 'status': status,
                           'due': due, 'recurrence': repeat[1] if repeat else None, 'historical': historical,
                           'overdue': bool(not historical and status in {'open', 'in_progress'} and due
@@ -449,7 +463,7 @@ def tasks(snapshot: Snapshot, *, as_of: str, timezone: str = 'UTC') -> dict:
         if len({(r['status'], r['due']) for r in rows}) > 1:
             for row in rows:
                 doc = snapshot.documents[row['source']]
-                findings.append(finding(doc, 'task.mirror_conflict', identity, {'identity': identity, 'occurrences': rows},
+                findings.append(finding(doc, 'task.mirror_conflict', row['entity_key'], {'identity': identity, 'occurrences': rows[:20], 'occurrence_count': len(rows)},
                                         line=row['line'], action='Compare active mirrors; do not infer completion from prose'))
     return snapshot.report(findings, tasks=ledger, as_of=as_of, timezone=timezone,
                            coverage_warning='Only declared checkbox syntax and explicit project-scoped task IDs are reconciled. Recurrence and prose completion require review.')

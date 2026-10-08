@@ -42,3 +42,10 @@ def test_recurrence_invalid_date_and_stable_id(tmp_path):
 def test_clock_required(tmp_path):
     with pytest.raises(ValueError):
         tasks(Snapshot(tmp_path).refresh(), as_of='tomorrow')
+
+
+def test_repeated_id_occurrences_are_distinct(tmp_path):
+    note(tmp_path, 'a.md', '- [ ] work [task:42]\n- [x] work [task:42]\n')
+    report = tasks(Snapshot(tmp_path).refresh(), as_of='2026-10-08')
+    assert len({r['occurrence_id'] for r in report['tasks']}) == 2
+    assert len({r['id'] for r in report['findings']}) == 2

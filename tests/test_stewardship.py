@@ -93,3 +93,10 @@ def test_symlinks_and_exclusions(tmp_path):
     assert not scan.documents
     assert not scan.report([])['complete']
     assert scan.diagnostics[0]['reason'] == 'symlink_not_scanned'
+
+
+def test_nested_duplicate_and_bom():
+    doc = parse_document('a.md', b'\xef\xbb\xbf---\nowner: User\n---\n')
+    assert doc.properties == {'owner': 'User'} and not doc.issues
+    nested = parse_document('b.md', b'---\nclaims:\n  - value: 1\n    value: 2\n---\n')
+    assert nested.issues[0]['rule'] == 'frontmatter.duplicate'
