@@ -130,3 +130,19 @@ revisions, and opportunities/uncertainty. They never label a lexical pair safe t
 merge and never transitively cluster candidate pairs. Missing candidates remain
 a measured retrieval limitation, not evidence that the vault has no duplicates.
 Embeddings, semantic classification, merge drafting, and consolidation are absent.
+
+## Structured contradictions (WP08.1)
+
+`steward_claims.contradictions(snapshot, fields, max_pairs=500)` consumes only
+frontmatter `claims` arrays. Every claim requires string `entity`, `field`, `unit`,
+`scope`, ISO `date`, `kind` (measurement/estimate/specification), and numerical
+`value`. Optional `qualifier` is a literal condition and `status` is
+current/superseded. Fields declare units as positive Decimal `factor` and optional
+`offset`, plus nonnegative tolerance. No guessed unit conversions.
+
+Pairs must share entity/field; scope/date/kind/condition mismatches and explicit
+supersession are separate classifications. Only incompatible values with all
+qualifiers matching become conflict findings, citing both revisions. Pair limits
+and truncation are visible. The latest note is never selected as truth. Broad
+prose contradictions, quotations, and inferred corrections require an optional
+model lane and are not evaluated by this deterministic stage.
