@@ -12,7 +12,7 @@ not a filesystem transaction. No authored files or sidecars are written.
 integer, boolean, list, date), optional `required`, `values`, and list `item_type`.
 Dates must be real ISO `YYYY-MM-DD` dates. YAML timestamp inference is disabled,
 so malformed dates are field defects rather than silently converted values.
-JSON-form frontmatter is supported. Duplicate top-level keys, malformed mappings,
+JSON-form frontmatter is supported. Duplicate keys at any mapping depth, malformed mappings,
 and YAML merge keys are frontmatter defects; such notes are not field-validated.
 
 Optional `aliases` maps legacy names to declared properties, producing review
@@ -32,9 +32,10 @@ Example:
 
 Reports contain source/line/revision/evidence, rule/version, severity, suggested
 action, and counts. `complete` reports scan diagnostics, not semantic coverage.
-IDs derive from path/rule/entity; renames change IDs until the lifecycle milestone.
+Stateless IDs derive from path/rule/entity; the optional lifecycle store described
+below supplies persistent identity across supported renames.
 No inference has been implemented or invoked by the property validator. The
-initial API is a Python backend; CLI/MCP integration is a later shared milestone.
+APIs are also exposed through the configured CLI/MCP runner described below.
 
 ## Attachment inventory (WP03.1)
 
