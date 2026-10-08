@@ -146,3 +146,17 @@ qualifiers matching become conflict findings, citing both revisions. Pair limits
 and truncation are visible. The latest note is never selected as truth. Broad
 prose contradictions, quotations, and inferred corrections require an optional
 model lane and are not evaluated by this deterministic stage.
+
+## Knowledge map (WP10.1)
+
+`steward_graph.knowledge_map(snapshot, scopes=None, target=None, limit=100)` builds
+existing resolved note edges from WP02 and explicit folder/type/frontmatter-tag
+navigation. It shows isolated notes as a graph condition, not a defect. Components
+use undirected existing edges only within identical scopes; existing cross-scope
+edges are shown separately and never become suggested links. A declared scope
+filter limits eligible nodes. `target` returns incoming/outgoing note paths and
+edge evidence; edge rows are bounded with total counts/truncation.
+
+No semantic connections, generated note writes, automatic indexes, or link
+insertion is implemented. Existing links remain evidence even if inappropriate;
+scope filters are analysis configuration, not a user-authentication mechanism.
