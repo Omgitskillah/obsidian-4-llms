@@ -101,3 +101,17 @@ Task/decision evidence is bounded (1..100 per section, default 20), with origina
 counts and truncation visible. Prose decision extraction and recent-change history
 are explicit evidence gaps. This is a metadata checklist, not a generated factual
 summary. Reports never choose next actions or modify statuses.
+
+## Inbox preview (WP05.1)
+
+`inbox_triage(snapshot, config)` accepts `inboxes` (path globs), `destinations`
+(folder -> `{scope: literal}`), and `rules` (`field`, exact `value`, `destination`).
+Every capture must declare frontmatter `scope`, matching the destination's scope.
+Unknown/mismatching scope, multiple routes, missing/excluded/symlink destinations,
+or no explicit route cause `leave_in_inbox`. Only an existing safe destination
+can produce `preview_move`. Note prose cannot override these configured rules.
+
+Suggestions carry source revision and always require revalidation before any
+future move. No move, new folder, new topic, metadata edit, or split occurs. The
+first lane supports explicit metadata only; implicit associations and acceptable
+semantic destination sets remain unvalidated optional work.

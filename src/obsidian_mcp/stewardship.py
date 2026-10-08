@@ -450,3 +450,48 @@ def project_reviews(snapshot: Snapshot, *, as_of: str, timezone: str = 'UTC', li
                         'evidence_gaps': ['prose decisions not interpreted', 'recent changes require a historical snapshot']})
     return snapshot.report(findings, reviews=reviews, as_of=as_of, timezone=timezone)
 
+
+def inbox_triage(snapshot: Snapshot, config: dict) -> dict:
+    """Preview explicit routes only; scope permission is declared, not inferred."""
+    if not isinstance(config, dict) or set(config) - {'inboxes', 'destinations', 'rules'}:
+        raise ValueError('Inbox config accepts inboxes/destinations/rules')
+    inboxes, destinations, rules = config.get('inboxes'), config.get('destinations'), config.get('rules')
+    if not isinstance(inboxes, list) or not all(isinstance(x, str) for x in inboxes) or not isinstance(destinations, dict) or not isinstance(rules, list):
+        raise ValueError('Invalid inbox configuration')
+    for path, spec in destinations.items():
+        if not isinstance(path, str) or not path or path.startswith('/') or '..' in Path(path).parts or not isinstance(spec, dict) or set(spec) != {'scope'} or not isinstance(spec['scope'], str):
+            raise ValueError('Destinations require safe vault-relative folders and explicit scope')
+    for rule in rules:
+        if not isinstance(rule, dict) or set(rule) != {'field', 'value', 'destination'} or not isinstance(rule['field'], str) or rule['destination'] not in destinations:
+            raise ValueError('Routing rules require field/value/declared destination')
+    queue, findings = [], []
+    for doc in snapshot.documents.values():
+        if doc.issues or not any(fnmatch.fnmatchcase(doc.path, pattern) for pattern in inboxes):
+            continue
+        matches = [r for r in rules if doc.properties.get(r['field']) == r['value'] and r['field'] in doc.properties]
+        proposed = sorted({r['destination'] for r in matches})
+        scope = doc.properties.get('scope')
+        allowed = [p for p in proposed if isinstance(scope, str) and destinations[p]['scope'] == scope]
+        if len(proposed) != len(allowed):
+            reason, destination = 'scope_unknown_or_mismatch', None
+        elif len(allowed) == 1:
+            reason, destination = 'explicit_metadata', allowed[0]
+        elif len(allowed) > 1:
+            reason, destination = 'ambiguous_routes', None
+        else:
+            reason, destination = 'no_explicit_route', None
+        # A vanished/renamed folder is a stale proposal, not an invented new topic.
+        if destination and not (snapshot.root / destination).is_dir():
+            reason, destination = 'destination_missing', None
+        if destination:
+            target = snapshot.root / destination
+            if (not target.resolve().is_relative_to(snapshot.root)
+                    or any(p.is_symlink() for p in [target, *target.parents] if p.is_relative_to(snapshot.root))
+                    or snapshot.policy.excludes(destination)):
+                reason, destination = 'destination_excluded', None
+        row = {'source': doc.path, 'revision': doc.revision, 'destination': destination,
+               'decision': 'preview_move' if destination else 'leave_in_inbox', 'reason': reason,
+               'scope': scope, 'evidence': matches, 'requires_revalidation': True}
+        queue.append(row)
+        findings.append(finding(doc, 'triage.route' if destination else 'triage.abstain', 'route', row))
+    return snapshot.report(findings, queue=queue, coverage_warning='Explicit property rules only; novel/implicit/multi-project captures require review. No files are moved.')
