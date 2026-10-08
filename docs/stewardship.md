@@ -160,3 +160,29 @@ edge evidence; edge rows are bounded with total counts/truncation.
 No semantic connections, generated note writes, automatic indexes, or link
 insertion is implemented. Existing links remain evidence even if inappropriate;
 scope filters are analysis configuration, not a user-authentication mechanism.
+
+## Search-index maintenance (WP11.1)
+
+The existing `semantic.Config` now tracks optional `OBSIDIAN_EMBED_DIGEST`,
+`OBSIDIAN_INDEX_PARSER_VERSION` (default 1), and JSON string-list
+`OBSIDIAN_INDEX_EXCLUSIONS`. Incompatible identities refuse refresh/search until
+an explicit rebuild. A configured digest is checked against Ollama `/api/tags`
+before each real embedding batch. Without a configured digest, status explicitly
+reports `digest_pinned: false`; model tags can still drift. Pinning is recommended
+for reproducible evaluations. Legacy indexes cannot adopt a new pinned digest or
+nondefault parser/exclusion configuration without rebuilding.
+
+`OBSIDIAN_EMBED_BATCH_CHUNKS` (default 16, range 1..256) bounds each embedding
+request. Results reject nonfinite vectors and mixed dimensions. Per-note updates
+remain transactional. Persisted pending paths, queue age, last error, indexed
+revisions and last reconciliation are exposed by `maintenance_status(conn, cfg)`.
+The queue is reconstructed from vault/index state after restart; cancellation
+leaves uncommitted notes pending. No independent competing vector index is added.
+
+`refresh(..., force_hash=True)` catches changed bytes with unchanged mtimes. Nuru's
+existing worker now uses this reconciliation on every pass and exposes `status`,
+`last_success`, and a `paused` Event that yields between notes. This increases
+no-change file reads but performs zero no-change embeddings. Lexical tools remain
+independent of semantic availability. Lock/corruption errors are retried by the
+existing worker; no automatic destructive database reset is introduced. Real
+retrieval quality and interactive contention measurements remain NOT RUN.

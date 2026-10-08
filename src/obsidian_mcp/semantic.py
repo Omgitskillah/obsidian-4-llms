@@ -22,10 +22,12 @@ import argparse
 import contextlib
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
 import sys
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping
@@ -38,6 +40,8 @@ import yaml
 from dotenv import load_dotenv
 
 from obsidian_mcp import index as note_index
+from obsidian_mcp import mutations
+from obsidian_mcp.link_integrity import Policy
 
 # The obsidian server's settings (VAULT_PATH, ...) live in the repo root's .env.obsidian.
 def _env_file() -> Path:
@@ -113,6 +117,10 @@ class Config:
     model: str
     chunk_chars: int
     ollama_host: str
+    model_digest: str = ''
+    parser_version: str = '1'
+    exclusions: tuple[str, ...] = ()
+    batch_chunks: int = 16
 
 
 def load_config(vault: Path, env: Mapping[str, str]) -> Config:
@@ -131,6 +139,13 @@ def load_config(vault: Path, env: Mapping[str, str]) -> Config:
         raise ValueError(f"OBSIDIAN_CHUNK_CHARS must be at least {_MIN_CHUNK_CHARS}, got {chunk_chars}.")
     db = env.get("OBSIDIAN_SEMANTIC_DB")
     host = (env.get("OLLAMA_HOST") or DEFAULT_OLLAMA_HOST).rstrip("/")
+    raw_exclusions = env.get('OBSIDIAN_INDEX_EXCLUSIONS', '[]')
+    exclusions = json.loads(raw_exclusions)
+    if not isinstance(exclusions, list) or not all(isinstance(x, str) and x for x in exclusions):
+        raise ValueError('OBSIDIAN_INDEX_EXCLUSIONS must be a JSON string list')
+    batch_chunks = int(env.get('OBSIDIAN_EMBED_BATCH_CHUNKS') or '16')
+    if not 1 <= batch_chunks <= 256:
+        raise ValueError('OBSIDIAN_EMBED_BATCH_CHUNKS must be 1..256')
     return Config(
         vault=vault,
         db_path=Path(db).expanduser() if db else vault / DB_NAME,
@@ -138,6 +153,9 @@ def load_config(vault: Path, env: Mapping[str, str]) -> Config:
         chunk_chars=chunk_chars,
         # OLLAMA_HOST is often written without a scheme ("127.0.0.1:11434"), as the ollama CLI accepts.
         ollama_host=host if "://" in host else f"http://{host}",
+        model_digest=env.get('OBSIDIAN_EMBED_DIGEST') or '',
+        parser_version=env.get('OBSIDIAN_INDEX_PARSER_VERSION') or '1',
+        exclusions=tuple(exclusions), batch_chunks=batch_chunks,
     )
 
 
@@ -149,6 +167,12 @@ def ollama_embedder(config: Config) -> Embed:
     """
 
     def embed(texts: list[str]) -> list[list[float]]:
+        if config.model_digest:
+            with urllib.request.urlopen(f'{config.ollama_host}/api/tags', timeout=_EMBED_TIMEOUT_SECONDS) as response:
+                models = json.load(response).get('models', [])
+            name = config.model if ':' in config.model else config.model + ':latest'
+            if not any(m.get('name') == name and m.get('digest') == config.model_digest for m in models):
+                raise ValueError('Embedding model digest does not match the pinned configuration')
         request = urllib.request.Request(
             f"{config.ollama_host}/api/embed",
             data=json.dumps({"model": config.model, "input": texts, "truncate": False}).encode(),
@@ -171,12 +195,14 @@ def ollama_embedder(config: Config) -> Embed:
     return embed
 
 
-def vault_notes(vault: Path) -> list[Path]:
+def vault_notes(vault: Path, exclusions: tuple[str, ...] = ()) -> list[Path]:
     """Every note the semantic index covers, sorted by path (see _SKIPPED_FOLDERS)."""
 
     def indexable(path: Path) -> bool:
         parts = path.relative_to(vault).parts
-        if parts[0] in _SKIPPED_FOLDERS or any(part.startswith(".") for part in parts):
+        if (parts[0] in _SKIPPED_FOLDERS or any(part.startswith(".") for part in parts)
+                or Policy(exclusions=exclusions).excludes(path.relative_to(vault).as_posix())
+                or any(p.is_symlink() for p in [path, *path.parents] if p.is_relative_to(vault))):
             return False
         try:
             return path.resolve().is_relative_to(vault)
@@ -290,9 +316,17 @@ def _meta(conn: sqlite3.Connection) -> dict[str, str]:
 def _check_compatible(conn: sqlite3.Connection, config: Config) -> None:
     """Refuse an index built with a different embedding model or chunk size."""
     meta = _meta(conn)
+    if meta.get('model') and (
+            (config.model_digest and 'model_digest' not in meta)
+            or (config.parser_version != '1' and 'parser_version' not in meta)
+            or (config.exclusions and 'exclusions' not in meta)):
+        raise ValueError('Legacy semantic index has no compatible configuration identity; rebuild it')
     for key, wanted, env_var in (
         ("model", config.model, "OBSIDIAN_EMBED_MODEL"),
         ("chunk_chars", str(config.chunk_chars), "OBSIDIAN_CHUNK_CHARS"),
+        ('model_digest', config.model_digest, 'OBSIDIAN_EMBED_DIGEST'),
+        ('parser_version', config.parser_version, 'OBSIDIAN_INDEX_PARSER_VERSION'),
+        ('exclusions', json.dumps(config.exclusions), 'OBSIDIAN_INDEX_EXCLUSIONS'),
     ):
         if key in meta and meta[key] != wanted:
             raise ValueError(
@@ -339,6 +373,8 @@ class RefreshResult:
     embedded: list[str] = field(default_factory=list)
     moved: list[tuple[str, str]] = field(default_factory=list)
     removed: list[str] = field(default_factory=list)
+    pending: list[str] = field(default_factory=list)
+    interrupted: bool = False
 
 
 def _delete_note(conn: sqlite3.Connection, path: str, has_vectors: bool) -> None:
@@ -364,6 +400,7 @@ def refresh(
     embed: Embed,
     on_progress: Callable[[int], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
+    force_hash: bool = False,
 ) -> RefreshResult:
     """Bring the index up to date with the vault, embedding only what changed.
 
@@ -381,6 +418,8 @@ def refresh(
     with conn:
         conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('model', ?)", (config.model,))
         conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('chunk_chars', ?)", (str(config.chunk_chars),))
+        for key, value in [('model_digest', config.model_digest), ('parser_version', config.parser_version), ('exclusions', json.dumps(config.exclusions))]:
+            conn.execute('INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)', (key, value))
     has_vectors = "dims" in _meta(conn)
     known = {row[0]: row for row in conn.execute("SELECT path, title, mtime_ns, hash FROM notes")}
     ids = _read_ids(config.vault)
@@ -388,14 +427,18 @@ def refresh(
 
     changed: list[_Note] = []
     seen: set[str] = set()
-    for path in vault_notes(config.vault):
+    for path in vault_notes(config.vault, config.exclusions):
         rel = str(path.relative_to(config.vault))
         seen.add(rel)
         mtime_ns = path.stat().st_mtime_ns
         old = known.get(rel)
-        if old is not None and old[2] == mtime_ns:
+        if old is not None and old[2] == mtime_ns and not force_hash:
             continue
-        text = path.read_text(errors="ignore")
+        before = path.stat()
+        text = mutations.read(config.vault, path).decode('utf-8')
+        after = path.stat()
+        if (before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns):
+            raise ValueError(f'Note changed during index read: {rel}')
         digest = hashlib.sha256(text.encode()).hexdigest()
         if old is not None and old[3] == digest:
             with conn:
@@ -427,15 +470,38 @@ def refresh(
             _delete_note(conn, rel, has_vectors)
     result.removed = sorted(gone)
 
+    result.pending = [n.path for n in changed]
+    def record_pending():
+        with conn:
+            if result.pending and not _meta(conn).get('pending_since'):
+                conn.execute("INSERT OR REPLACE INTO meta (key,value) VALUES ('pending_since',?)", (str(time.time()),))
+            if not result.pending:
+                conn.execute("DELETE FROM meta WHERE key='pending_since'")
+            conn.execute("INSERT OR REPLACE INTO meta (key,value) VALUES ('pending',?)", (json.dumps(result.pending),))
+            conn.execute("INSERT OR REPLACE INTO meta (key,value) VALUES ('queue_updated',?)", (str(time.time()),))
+    record_pending()
+
     for done, note in enumerate(changed):
         if should_stop is not None and should_stop():
+            result.interrupted = True
             break
         if on_progress is not None:
             on_progress(len(changed) - done)
         chunks = chunk_note(note.title, note.text, config.chunk_chars)
-        vectors = embed([_DOCUMENT_PREFIX + chunk for chunk in chunks]) if chunks else []
-        if len(vectors) != len(chunks):
-            raise ValueError(f"The embedder returned {len(vectors)} vectors for {len(chunks)} chunks.")
+        try:
+            vectors = []
+            for offset in range(0, len(chunks), config.batch_chunks):
+                vectors.extend(embed([_DOCUMENT_PREFIX + c for c in chunks[offset:offset + config.batch_chunks]]))
+            if any(not isinstance(v, (list, tuple)) or not v or any(not isinstance(x, (float, int)) or not math.isfinite(x) for x in v) for v in vectors):
+                raise ValueError('Embedder returned invalid/nonfinite vectors')
+            if vectors and any(len(v) != len(vectors[0]) for v in vectors):
+                raise ValueError('Embedder returned mixed vector dimensions')
+            if len(vectors) != len(chunks):
+                raise ValueError(f"The embedder returned {len(vectors)} vectors for {len(chunks)} chunks.")
+        except Exception as exc:
+            with conn:
+                conn.execute("INSERT OR REPLACE INTO meta (key,value) VALUES ('last_error',?)", (f'{type(exc).__name__}: {exc}',))
+            raise
         with conn:
             if vectors:
                 _ensure_vectors(conn, len(vectors[0]))
@@ -452,9 +518,29 @@ def refresh(
                     (chunk_id, sqlite_vec.serialize_float32(vector)),
                 )
         result.embedded.append(note.path)
+        result.pending.remove(note.path)
+        record_pending()
+    with conn:
+        if not result.interrupted:
+            conn.execute("INSERT OR REPLACE INTO meta (key,value) VALUES ('last_reconciliation',?)", (str(time.time()),))
+            conn.execute("DELETE FROM meta WHERE key='last_error'")
     if on_progress is not None:
         on_progress(0)
     return result
+
+
+def maintenance_status(conn: sqlite3.Connection, config: Config) -> dict:
+    """Observable persisted queue/configuration state; performs no inference."""
+    _check_compatible(conn, config)
+    meta = _meta(conn)
+    pending = json.loads(meta.get('pending', '[]'))
+    return {'pending': pending, 'pending_count': len(pending), 'last_error': meta.get('last_error'),
+            'queue_age_seconds': max(0, time.time() - float(meta['pending_since'])) if meta.get('pending_since') else 0,
+            'last_reconciliation': meta.get('last_reconciliation'), 'queue_updated': meta.get('queue_updated'),
+            'model': meta.get('model'), 'model_digest': meta.get('model_digest'),
+            'digest_pinned': bool(meta.get('model_digest')), 'dimensions': meta.get('dims'),
+            'parser_version': meta.get('parser_version'),
+            'indexed_revisions': dict(conn.execute('SELECT path, hash FROM notes'))}
 
 
 def search(conn: sqlite3.Connection, config: Config, embed: Embed, query: str, top_k: int) -> list[dict[str, Any]]:
