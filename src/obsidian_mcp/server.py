@@ -34,6 +34,7 @@ from obsidian_mcp import index as note_index
 from obsidian_mcp import semantic
 from obsidian_mcp import mutations
 from obsidian_mcp import link_integrity
+from obsidian_mcp.steward import Steward
 
 load_dotenv(semantic.ENV_FILE)
 
@@ -1372,6 +1373,30 @@ def audit_links(limit: int = 50, offset: int = 0, target_path: str | None = None
             _LINK_INDEX = link_integrity.LinkIndex(root, policy)
         return _LINK_INDEX.report(limit=limit, offset=offset, target_path=target_path,
                                   include_resolved=include_resolved)
+
+
+_STEWARD = None
+_STEWARD_CONFIG = None
+_STEWARD_LOCK = threading.RLock()
+
+
+@mcp.tool(description='Read-only configured vault stewardship digest. Requires OBSIDIAN_STEWARD_CONFIG JSON path; runs only explicitly selected deterministic packages. Findings page limit 1..100, compare snapshot across pages. No models or note edits. Review state writes are available only through the explicit standalone CLI, not this tool.',
+          annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+@_tool
+def audit_stewardship(limit: int = 50, offset: int = 0) -> dict[str, Any]:
+    global _STEWARD, _STEWARD_CONFIG
+    _check_accessible(VAULT_PATH)
+    path = os.environ.get('OBSIDIAN_STEWARD_CONFIG')
+    if not path:
+        return {'state': 'not_configured', 'hint': 'Set OBSIDIAN_STEWARD_CONFIG to an explicit JSON configuration file.'}
+    config = json.loads(Path(path).expanduser().read_text())
+    identity = (str(VAULT_PATH.resolve()), json.dumps(config, sort_keys=True))
+    with _STEWARD_LOCK:
+        if _STEWARD is None or _STEWARD_CONFIG != identity:
+            # This tool has no state_path: read-only annotations are literal.
+            _STEWARD = Steward(VAULT_PATH, config)
+            _STEWARD_CONFIG = identity
+        return _STEWARD.run_once(limit=limit, offset=offset)
 
 
 # An open task: a Markdown checkbox not yet ticked ("- [ ]", "* [ ]", "1. [ ]"), or a TODO

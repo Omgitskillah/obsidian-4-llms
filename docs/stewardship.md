@@ -186,3 +186,36 @@ no-change file reads but performs zero no-change embeddings. Lexical tools remai
 independent of semantic availability. Lock/corruption errors are retried by the
 existing worker; no automatic destructive database reset is introduced. Real
 retrieval quality and interactive contention measurements remain NOT RUN.
+
+## Configured runner, CLI and findings lifecycle
+
+`obsidian-mcp-steward VAULT --config CONFIG.json [--state STATE.sqlite3]` explicitly
+selects `packages`: properties, links, attachments, tasks, tables, reviews, triage,
+duplicates, claims, graph, index. Configuration objects use the backend contracts
+above: `schemas`, `attachments`, `tables`, `triage`, `duplicates`, `claims`, `graph`,
+plus `as_of`, `timezone`, optional `policy: {exclusions: [...]}`, and `index_env`
+(existing semantic environment keys). `index` only reads an existing index status;
+it never embeds or builds one. A missing index is not complete.
+
+Finding pages default 50, max 100; compare snapshots across pages. Without
+`--details`, feature arrays are summarized by counts and finding evidence has
+bounded excerpts/nesting with visible truncation. `--details` requests full
+feature-specific inventories. Notes over 16 MiB, aliases/merge keys in YAML, and
+read failures are diagnostics; metadata-based checks do not invent clean results.
+
+An optional state database must be outside authored files or excluded by policy.
+It records paths/entities, evidence-scoped acknowledgements/suppression, and
+resolution. Restart and unambiguous content/inode-preserving renames preserve
+entity IDs; ambiguous identical copies get new identities with a warning. There
+is no assumption of reliable identity for every rename across filesystems.
+Only complete passes retire disappeared findings. Changed evidence reopens review.
+Config/evidence changes invalidate suppression even with unchanged source bytes.
+No identifiers are written into notes. Existing unrelated SQLite databases and
+state paths through symlinks are rejected.
+
+Explicit CLI review adds `--review-id ID --evidence-revision HASH --review-status
+acknowledged|suppressed|open` alongside `--state`. It rescans before revision-checked
+sidecar review and never edits notes. The `audit_stewardship` MCP tool reads
+`OBSIDIAN_STEWARD_CONFIG`; it does not write sidecar state, and is not added to
+Nuru's default model tool allowlist. No inferred repairs, moves, merges, or deletes
+are performed by any package.

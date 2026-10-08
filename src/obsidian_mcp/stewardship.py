@@ -5,7 +5,8 @@ All note text is data. No inference, plugin execution, or authored-file writes.
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from datetime import date
 import fnmatch
 import hashlib
@@ -21,7 +22,7 @@ from markdown_it import MarkdownIt
 import yaml
 
 from obsidian_mcp import mutations
-from obsidian_mcp.link_integrity import Policy, LinkIndex, Reference, parse_note, _comments
+from obsidian_mcp.link_integrity import Policy, LinkIndex, Reference, parse_note, _comments, AuditCancelled
 
 
 class PropertyLoader(yaml.SafeLoader):
@@ -38,7 +39,7 @@ def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def asset_hash(root: Path, path: Path) -> tuple[str, int]:
+def asset_hash(root: Path, path: Path, should_stop: Callable[[], bool] | None = None) -> tuple[str, int]:
     """Hash regular assets in 1 MiB chunks through symlink-safe descriptors."""
     with mutations.parent(root, path) as (fd, name):
         file_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
@@ -48,6 +49,8 @@ def asset_hash(root: Path, path: Path) -> tuple[str, int]:
                 raise ValueError('not_regular_file')
             result, size = hashlib.sha256(), 0
             while chunk := file.read(1024 * 1024):
+                if should_stop and should_stop():
+                    raise AuditCancelled()
                 size += len(chunk)
                 result.update(chunk)
             after = os.fstat(file.fileno())
@@ -65,6 +68,7 @@ class Document:
     locations: dict[str, int]
     body: str
     issues: tuple[dict, ...]
+    identity_hint: str = ''
 
 
 def parse_document(path: str, data: bytes) -> Document:
@@ -82,6 +86,18 @@ def parse_document(path: str, data: bytes) -> Document:
                 node = yaml.compose(''.join(lines[1:end]), Loader=yaml.BaseLoader)
                 if node is not None and not isinstance(node, yaml.MappingNode):
                     raise ValueError('Frontmatter must be a mapping')
+                visited, pending = set(), [node] if node else []
+                while pending:
+                    current = pending.pop()
+                    if id(current) in visited:
+                        raise ValueError('YAML aliases are unsupported')
+                    visited.add(id(current))
+                    if len(visited) > 10000:
+                        raise ValueError('Frontmatter exceeds 10000 nodes')
+                    if isinstance(current, yaml.MappingNode):
+                        pending.extend(n for pair in current.value for n in pair)
+                    elif isinstance(current, yaml.SequenceNode):
+                        pending.extend(current.value)
                 seen = set()
                 for key, value in node.value if node else []:
                     if not isinstance(key, yaml.ScalarNode):
@@ -109,9 +125,10 @@ class Snapshot:
     Full reconciliation handles missed events and deletions. A changed file or
     read failure is a diagnostic, never a clean bill of health.
     """
-    def __init__(self, root: Path, policy: Policy | None = None):
+    def __init__(self, root: Path, policy: Policy | None = None, should_stop: Callable[[], bool] | None = None):
         self.root = root.resolve()
         self.policy = policy or Policy()
+        self.should_stop = should_stop
         self.documents: dict[str, Document] = {}
         self.assets: dict[str, tuple[str, int]] = {}
         self.diagnostics: list[dict] = []
@@ -137,6 +154,8 @@ class Snapshot:
                 elif self.policy.excludes(rel):
                     dirs.remove(name)
             for name in sorted(files):
+                if self.should_stop and self.should_stop():
+                    raise AuditCancelled()
                 path = base / name
                 rel = path.relative_to(self.root).as_posix()
                 if self.policy.excludes(rel):
@@ -146,9 +165,11 @@ class Snapshot:
                         raise ValueError('symlink_not_scanned')
                     before = path.lstat()
                     if path.suffix.lower() != '.md':
-                        assets[rel] = asset_hash(self.root, path)
+                        assets[rel] = asset_hash(self.root, path, self.should_stop)
                         bytes_read += assets[rel][1]
                         continue
+                    if before.st_size > 16 * 1024 * 1024:
+                        raise ValueError('note_exceeds_16MiB_limit')
                     data = mutations.read(self.root, path)
                     after = path.lstat()
                     bytes_read += len(data)
@@ -158,15 +179,17 @@ class Snapshot:
                     if path.suffix.lower() == '.md':
                         old = self.documents.get(rel)
                         if old and old.revision == revision:
-                            documents[rel] = old
+                            documents[rel] = replace(old, identity_hint=f'{before.st_dev}:{before.st_ino}')
                         else:
-                            documents[rel] = parse_document(rel, data)
+                            documents[rel] = replace(parse_document(rel, data), identity_hint=f'{before.st_dev}:{before.st_ino}')
                             parsed += 1
                     else:
                         assets[rel] = (revision, len(data))
                 except (OSError, ValueError, UnicodeError, RecursionError) as exc:
                     diagnostics.append({'path': rel, 'reason': str(exc)})
         self.documents, self.assets, self.diagnostics = documents, assets, diagnostics
+        self.diagnostics.extend({'path': p, 'line': issue['line'], 'reason': issue['rule']}
+                                for p, doc in documents.items() for issue in doc.issues)
         self.stats = {'parsed_notes': parsed, 'notes': len(documents), 'assets': len(assets), 'bytes_read': bytes_read}
         return self
 
@@ -182,7 +205,7 @@ class Snapshot:
 
 def finding(doc: Document, rule: str, key: str, evidence: Any, *, line: int = 1,
             severity: str = 'review', action: str = 'Review the cited evidence') -> dict:
-    return {'id': digest(f'{doc.path}\0{rule}\0{key}'.encode()), 'rule': rule, 'rule_version': '1',
+    return {'id': digest(f'{doc.path}\0{rule}\0{key}'.encode()), 'entity_key': key, 'rule': rule, 'rule_version': '1',
             'source': doc.path, 'line': line, 'revision': doc.revision, 'evidence': evidence,
             'severity': severity, 'proposed_action': action}
 
@@ -425,7 +448,7 @@ def project_reviews(snapshot: Snapshot, *, as_of: str, timezone: str = 'UTC', li
         if doc.issues or doc.properties.get('type') != 'project':
             continue
         project, status = doc.properties.get('project'), doc.properties.get('status')
-        if not isinstance(project, str) or not project or status not in {'active', 'paused', 'completed'}:
+        if not isinstance(project, str) or not project or not isinstance(status, str) or status not in {'active', 'paused', 'completed'}:
             findings.append(finding(doc, 'review.invalid_metadata', 'project', {'project': project, 'status': status}, severity='defect'))
             continue
         related = [t for t in task_report['tasks'] if t['project'] == project]
