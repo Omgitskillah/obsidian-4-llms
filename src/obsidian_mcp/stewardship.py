@@ -413,3 +413,40 @@ def tasks(snapshot: Snapshot, *, as_of: str, timezone: str = 'UTC') -> dict:
                                         line=row['line'], action='Compare active mirrors; do not infer completion from prose'))
     return snapshot.report(findings, tasks=ledger, as_of=as_of, timezone=timezone,
                            coverage_warning='Only declared checkbox syntax and explicit project-scoped task IDs are reconciled. Recurrence and prose completion require review.')
+
+
+def project_reviews(snapshot: Snapshot, *, as_of: str, timezone: str = 'UTC', limit: int = 20) -> dict:
+    if type(limit) is not int or not 1 <= limit <= 100:
+        raise ValueError('Review evidence limit must be 1..100')
+    task_report = tasks(snapshot, as_of=as_of, timezone=timezone)
+    today = date.fromisoformat(as_of)
+    findings, reviews = [], []
+    for doc in snapshot.documents.values():
+        if doc.issues or doc.properties.get('type') != 'project':
+            continue
+        project, status = doc.properties.get('project'), doc.properties.get('status')
+        if not isinstance(project, str) or not project or status not in {'active', 'paused', 'completed'}:
+            findings.append(finding(doc, 'review.invalid_metadata', 'project', {'project': project, 'status': status}, severity='defect'))
+            continue
+        related = [t for t in task_report['tasks'] if t['project'] == project]
+        decisions = [{'source': n.path, 'revision': n.revision, 'line': n.locations.get('decision_status', 1),
+                      'decision_id': n.properties.get('decision_id'), 'status': n.properties.get('decision_status'),
+                      'date': n.properties.get('date')}
+                     for n in snapshot.documents.values() if not n.issues and n.properties.get('type') == 'decision'
+                     and n.properties.get('project') == project]
+        due, next_action = doc.properties.get('review_due'), doc.properties.get('next_action')
+        if due is not None and not valid_date(due):
+            findings.append(finding(doc, 'review.invalid_due', 'due', due, line=doc.locations.get('review_due', 1), severity='defect'))
+        elif status == 'active' and due is not None and date.fromisoformat(due) <= today:
+            findings.append(finding(doc, 'review.due', 'due', {'review_due': due, 'as_of': as_of}, line=doc.locations.get('review_due', 1)))
+        if status == 'active' and (not isinstance(next_action, str) or not next_action.strip()):
+            findings.append(finding(doc, 'review.missing_next_action', 'next_action', {'project': project},
+                                    action='Review project and choose a next action; none is inferred'))
+        unresolved = [d for d in decisions if d['status'] in {'proposed', 'reopened'}]
+        reviews.append({'project': project, 'source': doc.path, 'revision': doc.revision, 'status': status,
+                        'review_due': due, 'next_action': next_action, 'tasks': related[:limit], 'task_count': len(related),
+                        'decisions': decisions[:limit], 'decision_count': len(decisions), 'unresolved_decision_count': len(unresolved),
+                        'evidence_truncated': len(related) > limit or len(decisions) > limit,
+                        'evidence_gaps': ['prose decisions not interpreted', 'recent changes require a historical snapshot']})
+    return snapshot.report(findings, reviews=reviews, as_of=as_of, timezone=timezone)
+

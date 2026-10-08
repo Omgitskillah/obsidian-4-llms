@@ -86,3 +86,18 @@ input cells prevent computing a total. Formulas explicitly name numeric `left`,
 uses Decimal. Reports retain raw input rows/lines and revisions, never overwrite
 cells. No exchange-rate lookup, arbitrary expression evaluator, locale inference,
 or prose extraction is provided.
+
+## Project review (WP06.1)
+
+`project_reviews(snapshot, as_of=..., timezone=..., limit=20)` recognizes explicit
+`type: project`, nonempty `project` ID, and `status: active/paused/completed`.
+Active projects are flagged for missing string `next_action` or an explicit
+`review_due` on/before the chosen date. Paused/completed projects are not labeled
+stale. `type: decision` notes with the same project are cited with their declared
+`decision_id`, `decision_status`, and `date`; proposed/reopened entries are counted
+unresolved. Conflicting records are retained rather than resolved by recency.
+
+Task/decision evidence is bounded (1..100 per section, default 20), with original
+counts and truncation visible. Prose decision extraction and recent-change history
+are explicit evidence gaps. This is a metadata checklist, not a generated factual
+summary. Reports never choose next actions or modify statuses.
