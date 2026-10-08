@@ -1,5 +1,5 @@
 """Declared Markdown tables and Decimal checks; never executes formulas."""
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, localcontext
 import fnmatch
 import re
 
@@ -27,7 +27,11 @@ def number(raw: str, spec: dict) -> Decimal:
     if not re.fullmatch(pattern, text):
         raise ValueError('invalid_number')
     value = Decimal(text.replace(separator, '.'))
-    return value / 100 if spec.get('percent') else value
+    if len(value.as_tuple().digits) > 80:
+        raise ValueError('number_exceeds_80_digit_limit')
+    with localcontext() as ctx:
+        ctx.prec = 200
+        return value / 100 if spec.get('percent') else value
 
 
 def validate(configs):
@@ -106,6 +110,12 @@ def row_width(line):
 
 
 def tables(snapshot: Snapshot, configs: list[dict]) -> dict:
+    with localcontext() as ctx:
+        ctx.prec = 200
+        return _tables(snapshot, configs)
+
+
+def _tables(snapshot: Snapshot, configs: list[dict]) -> dict:
     validate(configs)
     findings, checked, diagnostics = [], [], list(snapshot.diagnostics)
     for doc in snapshot.documents.values():

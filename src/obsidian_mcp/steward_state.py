@@ -13,16 +13,19 @@ APP_ID = 0x4E535431
 class State:
     def __init__(self, path: Path, snapshot: Snapshot):
         self.path = path.absolute()
+        if self.path.suffix not in {'.sqlite3', '.db'}:
+            raise ValueError('State path must end in .sqlite3 or .db')
         root = snapshot.root
         if self.path.is_relative_to(root) and not snapshot.policy.excludes(self.path.relative_to(root).as_posix()):
             raise ValueError('State database must be outside authored notes or excluded by policy')
         if any(p.is_symlink() for p in [self.path, *self.path.parents]):
             raise ValueError('State database path cannot contain symlinks')
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        existed = self.path.exists()
         self.conn = sqlite3.connect(self.path, timeout=5)
         app = self.conn.execute('PRAGMA application_id').fetchone()[0]
         tables = self.conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-        if app not in {0, APP_ID} or (app == 0 and tables):
+        if app not in {0, APP_ID} or (existed and app != APP_ID):
             self.conn.close()
             raise ValueError('Refusing an unrelated SQLite database')
         self.conn.execute(f'PRAGMA application_id={APP_ID}')
@@ -52,10 +55,11 @@ class State:
             if path in old:
                 entities[path] = old[path][0]
                 continue
-            candidates = [p for p, item in removed.items() if (doc.identity_hint and item[2] == doc.identity_hint) or item[1] == doc.revision]
+            hinted = [p for p, item in removed.items() if doc.identity_hint and item[2] == doc.identity_hint]
+            candidates = hinted or [p for p, item in removed.items() if item[1] == doc.revision]
             # Never assign one entity to two identical new notes or guess a rename.
             viable = [p for p in candidates if p not in claimed and sum(
-                (new.identity_hint and removed[p][2] == new.identity_hint) or removed[p][1] == new.revision
+                bool(new.identity_hint and removed[p][2] == new.identity_hint) if hinted else removed[p][1] == new.revision
                 for new in additions.values()) == 1]
             if len(viable) == 1:
                 source = viable[0]

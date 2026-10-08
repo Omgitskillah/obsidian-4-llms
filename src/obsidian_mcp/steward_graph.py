@@ -12,8 +12,7 @@ def knowledge_map(snapshot: Snapshot, *, scopes: list[str] | None = None,
     if type(limit) is not int or not 1 <= limit <= 1000:
         raise ValueError('Graph page limit must be 1..1000')
     nodes = {p: d for p, d in snapshot.documents.items() if scopes is None or d.properties.get('scope') in scopes}
-    index = LinkIndex(snapshot.root, snapshot.policy)
-    index.report(include_resolved=True)
+    index = snapshot.links()
     edges, adjacency, incoming, outgoing = [], defaultdict(set), defaultdict(set), defaultdict(set)
     navigation, boundary_edges = defaultdict(list), []
     for row in index.results:

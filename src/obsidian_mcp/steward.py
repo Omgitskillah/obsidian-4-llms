@@ -78,8 +78,7 @@ class Steward:
                 elif package == 'graph':
                     reports[package] = knowledge_map(scan, **config.get('graph', {}))
                 elif package == 'links':
-                    index = LinkIndex(scan.root, scan.policy)
-                    index.report()
+                    index = scan.links()
                     occurrences, rows = Counter(), []
                     for r in index.results:
                         occurrences[(r['source'], r['raw'])] += 1

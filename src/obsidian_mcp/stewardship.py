@@ -133,6 +133,9 @@ class Snapshot:
         self.assets: dict[str, tuple[str, int]] = {}
         self.diagnostics: list[dict] = []
         self.stats: dict = {}
+        self._generation = 0
+        self._links_generation = -1
+        self._links = None
 
     def refresh(self):
         if not self.root.is_dir():
@@ -191,7 +194,22 @@ class Snapshot:
         self.diagnostics.extend({'path': p, 'line': issue['line'], 'reason': issue['rule']}
                                 for p, doc in documents.items() for issue in doc.issues)
         self.stats = {'parsed_notes': parsed, 'notes': len(documents), 'assets': len(assets), 'bytes_read': bytes_read}
+        self._generation += 1
         return self
+
+    def links(self):
+        if self._links is None or self._links.policy != self.policy:
+            self._links = LinkIndex(self.root, self.policy, should_stop=self.should_stop)
+            self._links_generation = -1
+        if self._links_generation != self._generation:
+            self._links.report()
+            self._links_generation = self._generation
+            self.stats['link_parsed_notes'] = self._links.stats['parsed_notes']
+            self.stats['bytes_read'] += self._links.stats['bytes_read']
+            for path, note in self._links.notes.items():
+                if path in self.documents and self.documents[path].revision != note.revision:
+                    self.diagnostics.append({'path': path, 'reason': 'changed_between_snapshot_and_links'})
+        return self._links
 
     def report(self, findings: list[dict], **extra) -> dict:
         findings.sort(key=lambda f: (f['source'], f['line'], f['rule'], f['id']))
@@ -325,8 +343,7 @@ def attachments(snapshot: Snapshot, *, large_bytes: int = 100 * 1024 * 1024,
     """Inventory exact bytes and known ownership; never declares deletion safe."""
     if type(large_bytes) is not int or large_bytes <= 0:
         raise ValueError('large_bytes must be a positive integer')
-    index = LinkIndex(snapshot.root, snapshot.policy)
-    index.report(include_resolved=True)
+    index = snapshot.links()
     owners: dict[str, list[dict]] = {p: [] for p in snapshot.assets}
     findings = []
     diagnostics = list(snapshot.diagnostics) + index.diagnostics

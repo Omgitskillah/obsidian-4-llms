@@ -63,3 +63,10 @@ def test_malformed_rows_not_silently_padded(tmp_path):
     report = tables(Snapshot(tmp_path).refresh(), CONFIG)
     assert not report['tables']
     assert report['diagnostics'][0]['reason'] == 'unsupported_row_width'
+
+
+def test_large_integer_formula_not_rounded(tmp_path):
+    (tmp_path / 'a.md').write_text('| A | B | C |\n|---|---|---|\n| 123456789012345678901234567890 | 2 | 246913578024691357802469135780 |\n')
+    config = [{'name': 'huge', 'columns': {k: {'type': 'number'} for k in ['A', 'B', 'C']},
+               'formulas': [{'left': 'A', 'right': 'B', 'result': 'C', 'op': 'multiply'}]}]
+    assert not tables(Snapshot(tmp_path).refresh(), config)['findings']

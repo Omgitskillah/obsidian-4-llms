@@ -87,6 +87,10 @@ uses Decimal. Reports retain raw input rows/lines and revisions, never overwrite
 cells. No exchange-rate lookup, arbitrary expression evaluator, locale inference,
 or prose extraction is provided.
 
+Numerical cells are limited to 80 significant digits and arithmetic uses a local
+200-digit Decimal context; larger input cells are diagnosed instead of silently
+rounding to Python's default 28-digit context.
+
 ## Project review (WP06.1)
 
 `project_reviews(snapshot, as_of=..., timezone=..., limit=20)` recognizes explicit

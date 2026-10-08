@@ -107,3 +107,22 @@ def test_mcp_configured_and_unconfigured_readonly(tmp_path, monkeypatch):
     report = server.audit_stewardship()
     assert report['finding_count'] == 1 and report['model_calls'] == 0
     assert not list(tmp_path.glob('*.sqlite3'))
+
+
+def test_two_identical_renames_keep_inode_identities(tmp_path):
+    for name in ('a.md', 'b.md'):
+        (tmp_path / name).write_text('same bytes')
+    runner = Steward(tmp_path, CONFIG, state_path=tmp_path / '.state.sqlite3')
+    original = {f['source']: f['id'] for f in runner.run_once()['findings']}
+    (tmp_path / 'a.md').rename(tmp_path / 'c.md')
+    (tmp_path / 'b.md').rename(tmp_path / 'd.md')
+    moved = {f['source']: f['id'] for f in runner.run_once()['findings']}
+    assert moved == {'c.md': original['a.md'], 'd.md': original['b.md']}
+
+
+def test_empty_existing_database_not_adopted(tmp_path):
+    path = tmp_path / '.empty.sqlite3'
+    path.write_bytes(b'')
+    with pytest.raises(ValueError, match='unrelated'):
+        State(path, Steward(tmp_path, CONFIG).snapshot)
+    assert path.read_bytes() == b''
