@@ -115,3 +115,18 @@ Suggestions carry source revision and always require revalidation before any
 future move. No move, new folder, new topic, metadata edit, or split occurs. The
 first lane supports explicit metadata only; implicit associations and acceptable
 semantic destination sets remain unvalidated optional work.
+
+## Duplicate opportunities (WP07.1)
+
+`steward_duplicates.duplicates(snapshot, max_pairs=500, per_note=10, threshold=.7)`
+groups identical full-file SHA-256 bytes separately from whitespace-normalized
+full-text fingerprints. Frontmatter is retained in both fingerprints. Normalized
+groups are not asserted semantically interchangeable.
+
+Lexical candidates use five-word shingles, cap 512 features/note, 100 paths per
+posting, and explicit pair bounds. They require matching declared string `scope`.
+Reports expose metadata and numeric/negation token differences, bounded excerpts,
+revisions, and opportunities/uncertainty. They never label a lexical pair safe to
+merge and never transitively cluster candidate pairs. Missing candidates remain
+a measured retrieval limitation, not evidence that the vault has no duplicates.
+Embeddings, semantic classification, merge drafting, and consolidation are absent.
