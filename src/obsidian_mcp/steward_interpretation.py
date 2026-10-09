@@ -88,6 +88,10 @@ def interpret(snapshot: Snapshot, queue: list[dict], provider, token_counter, *,
                 current = mutations.read(snapshot.root, snapshot.root / source['source'])
                 if digest(current) != source['revision']:
                     raise ValueError('Source changed during interpretation')
+            for asset in candidate['facts'].get('assets', []):
+                current = mutations.read(snapshot.root, snapshot.root / asset['path'])
+                if digest(current) != asset['revision']:
+                    raise ValueError('Asset changed during interpretation')
         try:
             verify_sources()
         except Exception as exc:

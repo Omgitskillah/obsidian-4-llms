@@ -145,3 +145,15 @@ def test_rejects_wrong_total_and_task_completion(tmp_path):
         row['proposal']['values']['expected'] = '20.00'
         return row
     assert interpret(scan, queue, incorrect, lambda _:100, approval=APPROVAL)['results'][0]['status'] == 'INVALID'
+
+
+def test_attachment_revisions_revalidated(tmp_path):
+    (tmp_path/'a.md').write_text('![[pixel.png]]\n')
+    (tmp_path/'pixel.png').write_bytes(b'original asset')
+    scan=Snapshot(tmp_path).refresh()
+    queue=candidates(scan,[{'feature':'attachments','question':'Delete?','sources':['a.md']}])
+    def edit(*args):
+        (tmp_path/'pixel.png').write_bytes(b'changed asset')
+        return supported(*args)
+    row=interpret(scan,queue,edit,lambda _:100,approval=APPROVAL)['results'][0]
+    assert row['status'] == 'INVALID' and 'Asset changed' in row['reason']

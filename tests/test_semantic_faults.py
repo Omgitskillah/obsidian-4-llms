@@ -108,3 +108,13 @@ def test_index_cannot_be_reused_for_another_vault(tmp_path):
         semantic.refresh(conn,replace(config,vault=other),embed)
     assert semantic.maintenance_status(conn,config)['indexed_revisions'] == before
     conn.close()
+
+
+@pytest.mark.parametrize('suffix',['','-wal','-shm'])
+def test_database_and_sidecar_symlinks_rejected(tmp_path,suffix):
+    config=semantic.Config(tmp_path,tmp_path/'index.db','fake',400,'http://unused')
+    outside=tmp_path/'original';outside.write_bytes(b'preserve me')
+    (tmp_path/('index.db'+suffix)).symlink_to(outside)
+    with pytest.raises(ValueError,match='symlink'):
+        semantic.connect(config)
+    assert outside.read_bytes() == b'preserve me'

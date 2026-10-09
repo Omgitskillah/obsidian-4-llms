@@ -67,3 +67,10 @@ def test_unit_equivalence_and_conditions(tmp_path):
     assert 'supported' in row['allowed_decisions']
     (tmp_path/'b.md').write_text(note('2500','ms','hot'))
     assert 'supported' not in prepare(s.refresh(),'claims',['a.md','b.md'],config)['allowed_decisions']
+
+
+def test_incomplete_task_coverage_abstains(tmp_path):
+    s = scan(tmp_path, {'a.md':'- [ ] T [task:x]\n'})
+    s.diagnostics.append({'path':'unreadable.md','reason':'read_failure'})
+    with pytest.raises(ValueError,match='coverage'):
+        prepare(s,'tasks',['a.md'],{})

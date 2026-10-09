@@ -189,8 +189,17 @@ existing worker now uses this reconciliation on every pass and exposes `status`,
 `last_success`, and a `paused` Event that yields between notes. This increases
 no-change file reads but performs zero no-change embeddings. Lexical tools remain
 independent of semantic availability. Lock/corruption errors are retried by the
-existing worker; no automatic destructive database reset is introduced. Real
-retrieval quality and interactive contention measurements remain NOT RUN.
+existing worker; no automatic destructive database reset is introduced. Connections
+reject unrelated schemas and symlinked database/sidecar paths before writes; root
+identity prevents reuse for another vault after reconciliation. Use canonical
+paths. Lock waiting is bounded to one second. A mid-embedding edit preserves the
+old complete indexed revision and pending/error state for reconciliation.
+
+Nuru's 2026-10-09 readiness evaluation repeats ten Nomic v2 index sequences and
+45 query controls successfully. The retrieval contention gate **fails**: p95
+increases 30–41% under the measured live backlog. Overlapping background inference
+is not recommended; schedule it outside interaction or pause the existing worker.
+This measures retrieval, not whole-turn latency. No new automatic rollout is enabled.
 
 ## Configured runner, CLI and findings lifecycle
 
@@ -227,9 +236,18 @@ are performed by any package.
 
 ## Optional interpretation boundary
 
-`steward_interpretation.candidates` freezes an explicitly selected request queue
-with 1..4 eligible notes/candidate, bounded excerpts, exact revisions, and same
-declared scope for cross-note comparisons. `interpret` accepts an injected
+`steward_interpretation.candidates(snapshot, requests, config=...)` freezes an
+explicit queue, initially 1..4 eligible notes/candidate. The versioned
+`maintenance-evidence-v1` contract adds parsed facts, exact line spans, evidence
+IDs, limitations, allowed decisions and allowed proposal objects. Task preparation
+includes all active project-scoped mirrors even if only one note was requested;
+it fails rather than truncating contrary evidence. Up to 20 same-scope source
+notes, 32 evidence items and 24,000 UTF-8 bytes are permitted. Question text is
+separately capped at 1,000 characters. The old `excerpt_chars` argument remains
+accepted for callers but does not control or truncate this evidence contract.
+Caller-supplied `tables`/`claims` schemas determine calculations and unit comparisons.
+Properties/reviews/triage without typed proposals remain review-only; no prose
+owner/action/permission is promoted to a fact. `interpret` accepts an injected
 provider and rendered-chat token counter. Without a per-run `RunApproval` it
 refuses to call the provider. A live approval must be obtained from the human
 before constructing it; the record is an application attestation, not an external
@@ -242,10 +260,25 @@ model revision and measured usage. Budget mismatches stop the run. Results recor
 calls, tokens, latency, unprocessed candidates, and invalid responses. Yield can
 pause before a call. Failed requests are not retried silently.
 
-Format, verbatim citations, and unchanged source revisions are validated in code.
-Passing those checks does **not** prove semantic correctness: every suggestion
+Responses have exactly `decision`, `suggestion`, `evidence_ids` and `proposal`.
+Select all supplied IDs and one exact allowed proposal object. Unknown, repeated,
+missing and cross-candidate IDs are rejected. Code attaches original quotations,
+line spans and revisions; the model does not transcribe them. Numerical/status
+proposal values cannot override deterministic values or infer completion/permissions.
+Code-owned `facts`/`factual_statements` are separate from `ADVISORY_UNVERIFIED`
+suggestion prose. Conflicting task copies and navigation-only edges cannot yield a
+supported completion/dependency proposal. Asset bytes and source revisions are
+rechecked before and after inference; cancellation also prevents publication.
+Incomplete task coverage or changed evidence prevents candidate preparation.
+
+Validated results use `VALIDATED_EVIDENCE_AND_CONSTRAINTS`; the old quotation-only
+response format is rejected. Passing these checks does **not** prove semantic
+correctness: every suggestion
 still requires human semantic review; no automatic action is permitted. Feature
 question selection, provider integration, exact tokenizer/chat template, and
 model-quality grading remain separately configured work. Fake-provider tests do
 not demonstrate prompt-injection resistance or model efficacy. All live stages
-remain OFF and NOT RUN pending per-run permission.
+remain OFF by default. Authorized Nuru evaluations ran Qwen 3.5 4B locally: the
+readiness run passes 95/100 structural checks and 90/100 proposal controls, but
+advisory quality still fails due to invented attachment history. No production
+adapter, scheduling or semantic acceptance is claimed.

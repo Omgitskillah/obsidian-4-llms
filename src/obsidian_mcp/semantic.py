@@ -291,6 +291,9 @@ def connect(config: Config) -> sqlite3.Connection:
 
     WAL mode, so the server can search while Nuru's indexer writes.
     """
+    path = config.db_path.absolute()
+    if any(p.is_symlink() for p in [path, *path.parents, Path(str(path)+'-wal'), Path(str(path)+'-shm')]):
+        raise ValueError('Semantic database path cannot contain symlinks')
     config.db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(config.db_path, timeout=1)
     try:

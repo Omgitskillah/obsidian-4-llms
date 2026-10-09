@@ -134,6 +134,8 @@ def prepare(snapshot, feature, paths, config):
     if len(selected) > 20 or len(evidence) > MAX_EVIDENCE:
         raise ValueError('Evidence bound exceeded; contrary evidence cannot be truncated')
     docs = [snapshot.documents[p] for p in selected]
+    if any(r.get('path') in selected for r in snapshot.diagnostics) or (feature == 'tasks' and snapshot.diagnostics):
+        raise ValueError('Incomplete or changed evidence coverage; preparation abstains')
     if any(d.issues for d in docs):
         raise ValueError('Invalid evidence frontmatter')
     if len(docs) > 1 and (any(not isinstance(d.properties.get('scope'), str) for d in docs)
