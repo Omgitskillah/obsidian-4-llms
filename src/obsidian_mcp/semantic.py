@@ -292,12 +292,24 @@ def connect(config: Config) -> sqlite3.Connection:
     WAL mode, so the server can search while Nuru's indexer writes.
     """
     config.db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(config.db_path, timeout=30)
-    conn.enable_load_extension(True)
-    sqlite_vec.load(conn)
-    conn.enable_load_extension(False)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.executescript(_SCHEMA)
+    conn = sqlite3.connect(config.db_path, timeout=1)
+    try:
+        # Inspect before changing journal mode or adding tables. Legacy semantic
+        # indexes are accepted by their schema; unrelated databases are untouched.
+        names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if names and not {'meta', 'notes', 'chunks'} <= names:
+            raise ValueError('Refusing unrelated database as a semantic index')
+        for table, required in [('meta', {'key', 'value'}), ('notes', {'path','title','mtime_ns','hash'}), ('chunks', {'id','path','text'})]:
+            if table in names and not required <= {r[1] for r in conn.execute(f'PRAGMA table_info({table})')}:
+                raise ValueError('Refusing unrelated database schema as a semantic index')
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript(_SCHEMA)
+    except Exception:
+        conn.close()
+        raise
     return conn
 
 
@@ -316,6 +328,8 @@ def _meta(conn: sqlite3.Connection) -> dict[str, str]:
 def _check_compatible(conn: sqlite3.Connection, config: Config) -> None:
     """Refuse an index built with a different embedding model or chunk size."""
     meta = _meta(conn)
+    if meta.get('vault_root') and meta['vault_root'] != str(config.vault.resolve()):
+        raise ValueError('Semantic index belongs to a different vault root; explicitly rebuild a dedicated index')
     if meta.get('model') and (
             (config.model_digest and 'model_digest' not in meta)
             or (config.parser_version != '1' and 'parser_version' not in meta)
@@ -416,6 +430,7 @@ def refresh(
     """
     _check_compatible(conn, config)
     with conn:
+        conn.execute("INSERT OR IGNORE INTO meta (key,value) VALUES ('vault_root',?)", (str(config.vault.resolve()),))
         conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('model', ?)", (config.model,))
         conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('chunk_chars', ?)", (str(config.chunk_chars),))
         for key, value in [('model_digest', config.model_digest), ('parser_version', config.parser_version), ('exclusions', json.dumps(config.exclusions))]:
@@ -498,6 +513,9 @@ def refresh(
                 raise ValueError('Embedder returned mixed vector dimensions')
             if len(vectors) != len(chunks):
                 raise ValueError(f"The embedder returned {len(vectors)} vectors for {len(chunks)} chunks.")
+            current = mutations.read(config.vault, config.vault / note.path)
+            if hashlib.sha256(current).hexdigest() != note.hash:
+                raise ValueError(f'Note changed during embedding: {note.path}')
         except Exception as exc:
             with conn:
                 conn.execute("INSERT OR REPLACE INTO meta (key,value) VALUES ('last_error',?)", (f'{type(exc).__name__}: {exc}',))
