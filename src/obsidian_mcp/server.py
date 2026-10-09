@@ -14,6 +14,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import threading
 from collections import Counter
 from datetime import date, datetime
 from pathlib import Path
@@ -25,12 +26,15 @@ from unidecode import unidecode
 from dotenv import load_dotenv
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.types import ToolAnnotations
 from ulid import ULID
 
 from obsidian_mcp import frontmatter_template as template
 from obsidian_mcp import index as note_index
 from obsidian_mcp import semantic
 from obsidian_mcp import mutations
+from obsidian_mcp import link_integrity
+from obsidian_mcp.steward import Steward
 
 load_dotenv(semantic.ENV_FILE)
 
@@ -1346,6 +1350,53 @@ def find_broken_links() -> dict[str, Any]:
     elif len(broken) > _LIST_LIMIT:
         result["hint"] = f"Showing {_LIST_LIMIT} of {len(broken)} broken links."
     return result
+
+
+# One current vault snapshot; replacing it after a policy/root change prevents
+# stale findings from leaking between tests, clients, or vault configurations.
+_LINK_INDEX: link_integrity.LinkIndex | None = None
+_LINK_INDEX_LOCK = threading.RLock()
+
+
+@mcp.tool(description="Read-only local link audit; no models or Obsidian app needed. Checks wikilinks, Markdown links, headings and block IDs. Returns bounded occurrence findings with revisions, status counts, diagnostics and snapshot. target_path selects incoming references to an exact vault-relative path; include_resolved includes all statuses. Default limit 50, max 100; compare snapshot between pages. Never edits notes. Filename candidates are suggestions, not confirmed repairs.",
+          annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+@_tool
+def audit_links(limit: int = 50, offset: int = 0, target_path: str | None = None,
+                include_resolved: bool = False) -> dict[str, Any]:
+    global _LINK_INDEX
+    _check_accessible(VAULT_PATH)
+    policy_path = os.environ.get("OBSIDIAN_LINK_POLICY")
+    policy = link_integrity.Policy.load(Path(policy_path).expanduser() if policy_path else None)
+    with _LINK_INDEX_LOCK:
+        root = VAULT_PATH.resolve()
+        if _LINK_INDEX is None or _LINK_INDEX.vault != root or _LINK_INDEX.policy != policy:
+            _LINK_INDEX = link_integrity.LinkIndex(root, policy)
+        return _LINK_INDEX.report(limit=limit, offset=offset, target_path=target_path,
+                                  include_resolved=include_resolved)
+
+
+_STEWARD = None
+_STEWARD_CONFIG = None
+_STEWARD_LOCK = threading.RLock()
+
+
+@mcp.tool(description='Read-only configured vault stewardship digest. Requires OBSIDIAN_STEWARD_CONFIG JSON path; runs only explicitly selected deterministic packages. Findings page limit 1..100, compare snapshot across pages. No models or note edits. Review state writes are available only through the explicit standalone CLI, not this tool.',
+          annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+@_tool
+def audit_stewardship(limit: int = 50, offset: int = 0) -> dict[str, Any]:
+    global _STEWARD, _STEWARD_CONFIG
+    _check_accessible(VAULT_PATH)
+    path = os.environ.get('OBSIDIAN_STEWARD_CONFIG')
+    if not path:
+        return {'state': 'not_configured', 'hint': 'Set OBSIDIAN_STEWARD_CONFIG to an explicit JSON configuration file.'}
+    config = json.loads(Path(path).expanduser().read_text())
+    identity = (str(VAULT_PATH.resolve()), json.dumps(config, sort_keys=True))
+    with _STEWARD_LOCK:
+        if _STEWARD is None or _STEWARD_CONFIG != identity:
+            # This tool has no state_path: read-only annotations are literal.
+            _STEWARD = Steward(VAULT_PATH, config)
+            _STEWARD_CONFIG = identity
+        return _STEWARD.run_once(limit=limit, offset=offset)
 
 
 # An open task: a Markdown checkbox not yet ticked ("- [ ]", "* [ ]", "1. [ ]"), or a TODO

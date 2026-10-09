@@ -1,0 +1,551 @@
+"""Read-only stewardship snapshots and explicit-schema property validation.
+
+All note text is data. No inference, plugin execution, or authored-file writes.
+"""
+from __future__ import annotations
+
+from collections import Counter
+from collections.abc import Callable
+from dataclasses import dataclass, replace
+from datetime import date
+import fnmatch
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+from typing import Any
+from zoneinfo import ZoneInfo
+
+from markdown_it import MarkdownIt
+import yaml
+
+from obsidian_mcp import mutations
+from obsidian_mcp.link_integrity import Policy, LinkIndex, Reference, parse_note, _comments, AuditCancelled
+
+
+class PropertyLoader(yaml.SafeLoader):
+    """Keep dates as authored strings; validate them explicitly after parsing."""
+
+
+PropertyLoader.yaml_implicit_resolvers = {
+    key: [(tag, pattern) for tag, pattern in values if tag != 'tag:yaml.org,2002:timestamp']
+    for key, values in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
+
+
+def digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def asset_hash(root: Path, path: Path, should_stop: Callable[[], bool] | None = None) -> tuple[str, int]:
+    """Hash regular assets in 1 MiB chunks through symlink-safe descriptors."""
+    with mutations.parent(root, path) as (fd, name):
+        file_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+        with os.fdopen(file_fd, 'rb') as file:
+            before = os.fstat(file.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise ValueError('not_regular_file')
+            result, size = hashlib.sha256(), 0
+            while chunk := file.read(1024 * 1024):
+                if should_stop and should_stop():
+                    raise AuditCancelled()
+                size += len(chunk)
+                result.update(chunk)
+            after = os.fstat(file.fileno())
+            if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+                raise ValueError('changed_during_read')
+            return result.hexdigest(), size
+
+
+@dataclass(frozen=True)
+class Document:
+    path: str
+    revision: str
+    text: str
+    properties: dict
+    locations: dict[str, int]
+    body: str
+    issues: tuple[dict, ...]
+    identity_hint: str = ''
+
+
+def parse_document(path: str, data: bytes) -> Document:
+    text = data.decode('utf-8-sig')
+    properties, locations, issues = {}, {}, []
+    body = text
+    lines = text.splitlines(keepends=True)
+    if lines and lines[0].strip() == '---':
+        end = next((i for i in range(1, len(lines)) if lines[i].strip() in {'---', '...'}), None)
+        if end is None:
+            issues.append({'line': 1, 'rule': 'frontmatter.syntax', 'evidence': 'Unclosed frontmatter'})
+        else:
+            body = '\n' * (end + 1) + ''.join(lines[end + 1:])
+            try:
+                node = yaml.compose(''.join(lines[1:end]), Loader=yaml.BaseLoader)
+                if node is not None and not isinstance(node, yaml.MappingNode):
+                    raise ValueError('Frontmatter must be a mapping')
+                visited, pending = set(), [node] if node else []
+                while pending:
+                    current = pending.pop()
+                    if id(current) in visited:
+                        raise ValueError('YAML aliases are unsupported')
+                    visited.add(id(current))
+                    if len(visited) > 10000:
+                        raise ValueError('Frontmatter exceeds 10000 nodes')
+                    if isinstance(current, yaml.MappingNode):
+                        nested_seen = set()
+                        if current is not node:
+                            for key, value in current.value:
+                                if not isinstance(key, yaml.ScalarNode):
+                                    raise ValueError('Nested property keys must be scalar strings')
+                                if key.value in nested_seen:
+                                    issues.append({'line': key.start_mark.line + 2, 'rule': 'frontmatter.duplicate', 'evidence': key.value})
+                                nested_seen.add(key.value)
+                                if key.value == '<<':
+                                    raise ValueError('YAML merge keys are unsupported')
+                        pending.extend(n for pair in current.value for n in pair)
+                    elif isinstance(current, yaml.SequenceNode):
+                        pending.extend(current.value)
+                seen = set()
+                for key, value in node.value if node else []:
+                    if not isinstance(key, yaml.ScalarNode):
+                        raise ValueError('Property keys must be scalar strings')
+                    name = key.value
+                    locations[name] = key.start_mark.line + 2
+                    if name in seen:
+                        issues.append({'line': locations[name], 'rule': 'frontmatter.duplicate', 'evidence': name})
+                    seen.add(name)
+                    if name == '<<':
+                        raise ValueError('YAML merge keys are unsupported')
+                loaded = yaml.load(''.join(lines[1:end]), Loader=PropertyLoader)
+                properties = loaded or {}
+                if not isinstance(properties, dict) or any(not isinstance(k, str) for k in properties):
+                    raise ValueError('Property keys must be strings')
+            except (yaml.YAMLError, ValueError, RecursionError) as exc:
+                issues.append({'line': 1, 'rule': 'frontmatter.syntax', 'evidence': str(exc)})
+                properties = {}
+    return Document(path, digest(data), text, properties, locations, body, tuple(issues))
+
+
+class Snapshot:
+    """Hash every eligible file; reuse parsed documents by content revision.
+
+    Full reconciliation handles missed events and deletions. A changed file or
+    read failure is a diagnostic, never a clean bill of health.
+    """
+    def __init__(self, root: Path, policy: Policy | None = None, should_stop: Callable[[], bool] | None = None):
+        self.root = root.resolve()
+        self.policy = policy or Policy()
+        self.should_stop = should_stop
+        self.documents: dict[str, Document] = {}
+        self.assets: dict[str, tuple[str, int]] = {}
+        self.diagnostics: list[dict] = []
+        self.stats: dict = {}
+        self._generation = 0
+        self._links_generation = -1
+        self._links = None
+
+    def refresh(self):
+        if not self.root.is_dir():
+            raise ValueError('Vault must be an existing directory')
+        documents, assets, diagnostics = {}, {}, []
+        parsed, bytes_read = 0, 0
+
+        def error(exc):
+            diagnostics.append({'path': str(exc.filename), 'reason': str(exc)})
+
+        for folder, dirs, files in os.walk(self.root, followlinks=False, onerror=error):
+            base = Path(folder)
+            for name in list(dirs):
+                path = base / name
+                rel = path.relative_to(self.root).as_posix()
+                if path.is_symlink():
+                    diagnostics.append({'path': rel, 'reason': 'symlink_not_scanned'})
+                    dirs.remove(name)
+                elif self.policy.excludes(rel):
+                    dirs.remove(name)
+            for name in sorted(files):
+                if self.should_stop and self.should_stop():
+                    raise AuditCancelled()
+                path = base / name
+                rel = path.relative_to(self.root).as_posix()
+                if self.policy.excludes(rel):
+                    continue
+                try:
+                    if path.is_symlink():
+                        raise ValueError('symlink_not_scanned')
+                    before = path.lstat()
+                    if path.suffix.lower() != '.md':
+                        assets[rel] = asset_hash(self.root, path, self.should_stop)
+                        bytes_read += assets[rel][1]
+                        continue
+                    if before.st_size > 16 * 1024 * 1024:
+                        raise ValueError('note_exceeds_16MiB_limit')
+                    data = mutations.read(self.root, path)
+                    after = path.lstat()
+                    bytes_read += len(data)
+                    if (before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns):
+                        raise ValueError('changed_during_read')
+                    revision = digest(data)
+                    if path.suffix.lower() == '.md':
+                        old = self.documents.get(rel)
+                        if old and old.revision == revision:
+                            documents[rel] = replace(old, identity_hint=f'{before.st_dev}:{before.st_ino}')
+                        else:
+                            documents[rel] = replace(parse_document(rel, data), identity_hint=f'{before.st_dev}:{before.st_ino}')
+                            parsed += 1
+                    else:
+                        assets[rel] = (revision, len(data))
+                except (OSError, ValueError, UnicodeError, RecursionError) as exc:
+                    diagnostics.append({'path': rel, 'reason': str(exc)})
+        self.documents, self.assets, self.diagnostics = documents, assets, diagnostics
+        self.diagnostics.extend({'path': p, 'line': issue['line'], 'reason': issue['rule']}
+                                for p, doc in documents.items() for issue in doc.issues)
+        self.stats = {'parsed_notes': parsed, 'notes': len(documents), 'assets': len(assets), 'bytes_read': bytes_read}
+        self._generation += 1
+        return self
+
+    def links(self):
+        if self._links is None or self._links.policy != self.policy:
+            self._links = LinkIndex(self.root, self.policy, should_stop=self.should_stop)
+            self._links_generation = -1
+        if self._links_generation != self._generation:
+            self._links.report()
+            self._links_generation = self._generation
+            self.stats['link_parsed_notes'] = self._links.stats['parsed_notes']
+            self.stats['bytes_read'] += self._links.stats['bytes_read']
+            for path, note in self._links.notes.items():
+                if path in self.documents and self.documents[path].revision != note.revision:
+                    self.diagnostics.append({'path': path, 'reason': 'changed_between_snapshot_and_links'})
+        return self._links
+
+    def report(self, findings: list[dict], **extra) -> dict:
+        findings.sort(key=lambda f: (f['source'], f['line'], f['rule'], f['id']))
+        revisions = {p: d.revision for p, d in self.documents.items()}
+        revisions.update({p: item[0] for p, item in self.assets.items()})
+        snapshot = digest(json.dumps({'revisions': revisions, 'findings': findings, 'diagnostics': self.diagnostics}, sort_keys=True, default=str).encode())
+        return {'version': '1', 'snapshot': snapshot, 'complete': not self.diagnostics,
+                'findings': findings, 'counts': dict(Counter(f['rule'] for f in findings)),
+                'diagnostics': self.diagnostics, 'stats': self.stats, 'model_calls': 0, **extra}
+
+
+def finding(doc: Document, rule: str, key: str, evidence: Any, *, line: int = 1,
+            severity: str = 'review', action: str = 'Review the cited evidence') -> dict:
+    return {'id': digest(f'{doc.path}\0{rule}\0{key}'.encode()), 'entity_key': key, 'rule': rule, 'rule_version': '1',
+            'source': doc.path, 'line': line, 'revision': doc.revision, 'evidence': evidence,
+            'severity': severity, 'proposed_action': action}
+
+
+def body_lines(doc: Document, *, quotes: bool = False) -> list[tuple[int, str]]:
+    """Visible body lines, with examples/code/comments masked and line numbers kept."""
+    text = _comments(doc.body)
+    lines = text.splitlines()
+    excluded = set()
+    for token in MarkdownIt('commonmark').parse(text):
+        if token.type in {'fence', 'code_block'} and token.map:
+            excluded.update(range(*token.map))
+    return [(i + 1, line) for i, line in enumerate(lines)
+            if i not in excluded and (quotes or not line.lstrip().startswith('>'))]
+
+
+TYPES = {'string': lambda v: isinstance(v, str),
+         'number': lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+         'integer': lambda v: isinstance(v, int) and not isinstance(v, bool),
+         'boolean': lambda v: isinstance(v, bool),
+         'list': lambda v: isinstance(v, list),
+         'date': lambda v: valid_date(v)}
+
+
+def valid_date(value) -> bool:
+    if isinstance(value, date):
+        return type(value) is date
+    if not isinstance(value, str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}', value):
+        return False
+    try:
+        date.fromisoformat(value)
+        return True
+    except ValueError:
+        return False
+
+
+def validate_schemas(schemas: list[dict]) -> None:
+    if not isinstance(schemas, list):
+        raise ValueError('schemas must be a list')
+    names = set()
+    for schema in schemas:
+        if not isinstance(schema, dict) or set(schema) - {'name', 'glob', 'type', 'fields', 'aliases', 'rules'}:
+            raise ValueError('Invalid schema keys')
+        if not isinstance(schema.get('name'), str) or schema['name'] in names:
+            raise ValueError('Schema names must be unique strings')
+        names.add(schema['name'])
+        if not isinstance(schema.get('glob', '*.md'), str) or not isinstance(schema.get('fields'), dict):
+            raise ValueError('Schema requires fields and a path glob')
+        for field, spec in schema['fields'].items():
+            if not isinstance(field, str) or not isinstance(spec, dict) or set(spec) - {'type', 'required', 'values', 'item_type'}:
+                raise ValueError('Invalid field specification')
+            if spec.get('type') not in TYPES or spec.get('item_type', 'string') not in TYPES:
+                raise ValueError('Unsupported property type')
+            if 'required' in spec and not isinstance(spec['required'], bool):
+                raise ValueError('required must be boolean')
+            if 'values' in spec and not isinstance(spec['values'], list):
+                raise ValueError('values must be a list')
+        aliases = schema.get('aliases', {})
+        if not isinstance(aliases, dict) or any(not isinstance(k, str) or v not in schema['fields'] for k, v in aliases.items()):
+            raise ValueError('aliases must map legacy property names to declared fields')
+        for rule in schema.get('rules', []):
+            if not isinstance(rule, dict) or set(rule) != {'left', 'op', 'right'} or rule['op'] not in {'eq', 'le', 'requires'}:
+                raise ValueError('Cross-field rules accept left/op/right: eq, le, requires')
+            if rule['left'] not in schema['fields'] or rule['right'] not in schema['fields']:
+                raise ValueError('Cross-field rules reference undeclared fields')
+
+
+def properties(snapshot: Snapshot, schemas: list[dict]) -> dict:
+    validate_schemas(schemas)  # Bad configuration fails before note classification.
+    findings = []
+    for doc in snapshot.documents.values():
+        for issue in doc.issues:
+            findings.append(finding(doc, issue['rule'], str(issue['line']), issue['evidence'], line=issue['line'], severity='defect'))
+        if doc.issues:
+            continue
+        applicable = [s for s in schemas if fnmatch.fnmatchcase(doc.path, s.get('glob', '*.md'))
+                      and ('type' not in s or doc.properties.get('type') == s['type'])]
+        declared = {}
+        for schema in applicable:
+            for key, spec in schema['fields'].items():
+                if key in declared and declared[key] != spec:
+                    raise ValueError(f'Conflicting schemas for {doc.path}: {key}')
+                declared[key] = spec
+                value = doc.properties.get(key)
+                reason = None
+                if key not in doc.properties:
+                    if spec.get('required'):
+                        reason = 'missing'
+                elif not TYPES[spec['type']](value):
+                    reason = 'type'
+                elif spec['type'] == 'list' and 'item_type' in spec and not all(TYPES[spec['item_type']](v) for v in value):
+                    reason = 'item_type'
+                elif 'values' in spec and value not in spec['values']:
+                    reason = 'value'
+                if reason:
+                    findings.append(finding(doc, f'property.{reason}', f'{schema["name"]}:{key}',
+                                            {'property': key, 'actual': value, 'expected': spec},
+                                            line=doc.locations.get(key, 1), severity='defect'))
+            for alias, canonical in schema.get('aliases', {}).items():
+                if alias in doc.properties:
+                    findings.append(finding(doc, 'property.alias', alias, {'property': alias, 'canonical': canonical}, line=doc.locations[alias]))
+            for rule in schema.get('rules', []):
+                left, right = doc.properties.get(rule['left']), doc.properties.get(rule['right'])
+                try:
+                    ok = (left == right if rule['op'] == 'eq' else left <= right if rule['op'] == 'le'
+                          else left is None or right is not None)
+                except TypeError:
+                    ok = False
+                if not ok:
+                    findings.append(finding(doc, 'property.cross_field', json.dumps(rule, sort_keys=True),
+                                            {'rule': rule, 'left': left, 'right': right}, severity='defect'))
+    return snapshot.report(findings, schemas=[s['name'] for s in schemas])
+
+
+def attachments(snapshot: Snapshot, *, large_bytes: int = 100 * 1024 * 1024,
+                reference_properties: tuple[str, ...] = ()) -> dict:
+    """Inventory exact bytes and known ownership; never declares deletion safe."""
+    if type(large_bytes) is not int or large_bytes <= 0:
+        raise ValueError('large_bytes must be a positive integer')
+    index = snapshot.links()
+    owners: dict[str, list[dict]] = {p: [] for p in snapshot.assets}
+    findings = []
+    diagnostics = list(snapshot.diagnostics) + index.diagnostics
+    for row in index.results:
+        if row.get('path') in owners:
+            owners[row['path']].append({'source': row['source'], 'line': row['line'], 'syntax': row['syntax']})
+        if row['status'] == 'broken' and row.get('embed'):
+            doc = snapshot.documents.get(row['source'])
+            if doc:
+                findings.append(finding(doc, 'attachment.missing_embed', row['finding_id'], row, line=row['line'], severity='defect'))
+    for doc in snapshot.documents.values():
+        for key in reference_properties:
+            value = doc.properties.get(key, [])
+            for raw in value if isinstance(value, list) else [value]:
+                if not isinstance(raw, str):
+                    continue
+                refs = parse_note(raw.encode()).references
+                if not refs:
+                    refs = [Reference(1, raw, raw, 'wiki', True)]
+                for ref in refs:
+                    result = index._resolve(doc.path, ref)
+                    if result.get('path') in owners:
+                        owners[result['path']].append({'source': doc.path, 'line': doc.locations[key], 'syntax': 'property', 'property': key})
+    for path in snapshot.assets:
+        if not path.endswith('.canvas'):
+            continue
+        try:
+            if snapshot.assets[path][1] > 16 * 1024 * 1024:
+                raise ValueError('canvas_too_large')
+            canvas = json.loads(mutations.read(snapshot.root, snapshot.root / path))
+            if not isinstance(canvas, dict) or not isinstance(canvas.get('nodes', []), list):
+                raise ValueError('invalid_canvas')
+            for node in canvas.get('nodes', []):
+                if not isinstance(node, dict):
+                    raise ValueError('invalid_canvas_node')
+                if node.get('type') == 'file' and isinstance(node.get('file'), str):
+                    result = index._resolve(path, Reference(1, node['file'], '/' + node['file'].lstrip('/'), 'wiki', True))
+                    if result.get('path') in owners:
+                        owners[result['path']].append({'source': path, 'node': node.get('id'), 'syntax': 'canvas'})
+        except (OSError, ValueError, TypeError) as exc:
+            diagnostics.append({'path': path, 'reason': str(exc)})
+    grouped = {}
+    for path, (hash_, size) in snapshot.assets.items():
+        grouped.setdefault(hash_, []).append(path)
+    groups = [{'sha256': h, 'paths': sorted(paths), 'potential_duplicate_bytes': snapshot.assets[paths[0]][1] * (len(paths) - 1)}
+              for h, paths in sorted(grouped.items()) if len(paths) > 1]
+    inventory = [{'path': path, 'revision': hash_, 'bytes': size, 'large': size >= large_bytes,
+                  'owners': owners[path], 'ownership': 'referenced' if owners[path] else 'unknown',
+                  'deletion_eligible': False}
+                 for path, (hash_, size) in sorted(snapshot.assets.items())]
+    return snapshot.report(findings, inventory=inventory, duplicate_groups=groups,
+                           potential_duplicate_bytes=sum(g['potential_duplicate_bytes'] for g in groups),
+                           coverage_warning='Unrecognized plugin references and excluded sources can own assets; no deletion eligibility is asserted.',
+                           complete=not diagnostics, diagnostics=diagnostics)
+
+
+def tasks(snapshot: Snapshot, *, as_of: str, timezone: str = 'UTC') -> dict:
+    """Task occurrences; only explicit IDs within an explicit project are mirrors."""
+    if not valid_date(as_of):
+        raise ValueError('as_of must be an ISO date')
+    ZoneInfo(timezone)  # Declared local calendar date, not machine wall clock.
+    today = date.fromisoformat(as_of)
+    ledger, findings, mirrors = [], [], {}
+    for doc in snapshot.documents.values():
+        if doc.issues:
+            continue
+        counts = Counter()
+        key_counts = Counter()
+        project = doc.properties.get('project')
+        historical = doc.properties.get('task_record') == 'historical'
+        for line_no, line in body_lines(doc):
+            match = re.match(r'^\s*(?:[-*+]|\d+[.)])\s+\[([^\]])\]\s+(.*)', line)
+            if not match:
+                continue
+            mark, text = match.groups()
+            if mark.lower() not in {' ', 'x', '-', '/'}:
+                findings.append(finding(doc, 'task.unsupported_status', str(line_no), line, line=line_no))
+                continue
+            status = {' ': 'open', 'x': 'completed', '-': 'canceled', '/': 'in_progress'}[mark.lower()]
+            id_match = re.search(r'\[task:([\w.-]+)\]', text)
+            due_match = re.search(r'(?:\[due:([^\]]+)\]|📅\s*(\S+))', text)
+            due = (due_match.group(1) or due_match.group(2)).strip() if due_match else None
+            repeat = re.search(r'\[repeat:([^\]]+)\]', text)
+            counts[text] += 1
+            identity = f'{project}:{id_match[1]}' if id_match and isinstance(project, str) and project else None
+            key = id_match[1] if id_match else f'{text}:{counts[text]}'
+            key_counts[key] += 1
+            key = f'{key}:{key_counts[key]}'
+            occurrence = {'source': doc.path, 'line': line_no, 'revision': doc.revision,
+                          'occurrence_id': digest(f'{doc.path}\0{key}'.encode()),
+                          'entity_key': key,
+                          'identity': identity, 'project': project, 'text': text, 'status': status,
+                          'due': due, 'recurrence': repeat[1] if repeat else None, 'historical': historical,
+                          'overdue': bool(not historical and status in {'open', 'in_progress'} and due
+                                          and valid_date(due) and date.fromisoformat(due) < today)}
+            ledger.append(occurrence)
+            if due and not valid_date(due):
+                findings.append(finding(doc, 'task.invalid_due', key, occurrence, line=line_no, severity='defect'))
+            if occurrence['overdue']:
+                findings.append(finding(doc, 'task.overdue', key, occurrence, line=line_no))
+            if repeat:
+                findings.append(finding(doc, 'task.recurrence_review', key, occurrence, line=line_no,
+                                        action='Review explicit recurrence; no future occurrence is inferred'))
+            if identity and not historical:
+                mirrors.setdefault(identity, []).append(occurrence)
+    for identity, rows in mirrors.items():
+        if len({(r['status'], r['due']) for r in rows}) > 1:
+            for row in rows:
+                doc = snapshot.documents[row['source']]
+                findings.append(finding(doc, 'task.mirror_conflict', row['entity_key'], {'identity': identity, 'occurrences': rows[:20], 'occurrence_count': len(rows)},
+                                        line=row['line'], action='Compare active mirrors; do not infer completion from prose'))
+    return snapshot.report(findings, tasks=ledger, as_of=as_of, timezone=timezone,
+                           coverage_warning='Only declared checkbox syntax and explicit project-scoped task IDs are reconciled. Recurrence and prose completion require review.')
+
+
+def project_reviews(snapshot: Snapshot, *, as_of: str, timezone: str = 'UTC', limit: int = 20) -> dict:
+    if type(limit) is not int or not 1 <= limit <= 100:
+        raise ValueError('Review evidence limit must be 1..100')
+    task_report = tasks(snapshot, as_of=as_of, timezone=timezone)
+    today = date.fromisoformat(as_of)
+    findings, reviews = [], []
+    for doc in snapshot.documents.values():
+        if doc.issues or doc.properties.get('type') != 'project':
+            continue
+        project, status = doc.properties.get('project'), doc.properties.get('status')
+        if not isinstance(project, str) or not project or not isinstance(status, str) or status not in {'active', 'paused', 'completed'}:
+            findings.append(finding(doc, 'review.invalid_metadata', 'project', {'project': project, 'status': status}, severity='defect'))
+            continue
+        related = [t for t in task_report['tasks'] if t['project'] == project]
+        decisions = [{'source': n.path, 'revision': n.revision, 'line': n.locations.get('decision_status', 1),
+                      'decision_id': n.properties.get('decision_id'), 'status': n.properties.get('decision_status'),
+                      'date': n.properties.get('date')}
+                     for n in snapshot.documents.values() if not n.issues and n.properties.get('type') == 'decision'
+                     and n.properties.get('project') == project]
+        due, next_action = doc.properties.get('review_due'), doc.properties.get('next_action')
+        if due is not None and not valid_date(due):
+            findings.append(finding(doc, 'review.invalid_due', 'due', due, line=doc.locations.get('review_due', 1), severity='defect'))
+        elif status == 'active' and due is not None and date.fromisoformat(due) <= today:
+            findings.append(finding(doc, 'review.due', 'due', {'review_due': due, 'as_of': as_of}, line=doc.locations.get('review_due', 1)))
+        if status == 'active' and (not isinstance(next_action, str) or not next_action.strip()):
+            findings.append(finding(doc, 'review.missing_next_action', 'next_action', {'project': project},
+                                    action='Review project and choose a next action; none is inferred'))
+        unresolved = [d for d in decisions if d['status'] in {'proposed', 'reopened'}]
+        reviews.append({'project': project, 'source': doc.path, 'revision': doc.revision, 'status': status,
+                        'review_due': due, 'next_action': next_action, 'tasks': related[:limit], 'task_count': len(related),
+                        'decisions': decisions[:limit], 'decision_count': len(decisions), 'unresolved_decision_count': len(unresolved),
+                        'evidence_truncated': len(related) > limit or len(decisions) > limit,
+                        'evidence_gaps': ['prose decisions not interpreted', 'recent changes require a historical snapshot']})
+    return snapshot.report(findings, reviews=reviews, as_of=as_of, timezone=timezone)
+
+
+def inbox_triage(snapshot: Snapshot, config: dict) -> dict:
+    """Preview explicit routes only; scope permission is declared, not inferred."""
+    if not isinstance(config, dict) or set(config) - {'inboxes', 'destinations', 'rules'}:
+        raise ValueError('Inbox config accepts inboxes/destinations/rules')
+    inboxes, destinations, rules = config.get('inboxes'), config.get('destinations'), config.get('rules')
+    if not isinstance(inboxes, list) or not all(isinstance(x, str) for x in inboxes) or not isinstance(destinations, dict) or not isinstance(rules, list):
+        raise ValueError('Invalid inbox configuration')
+    for path, spec in destinations.items():
+        if not isinstance(path, str) or not path or path.startswith('/') or '..' in Path(path).parts or not isinstance(spec, dict) or set(spec) != {'scope'} or not isinstance(spec['scope'], str):
+            raise ValueError('Destinations require safe vault-relative folders and explicit scope')
+    for rule in rules:
+        if not isinstance(rule, dict) or set(rule) != {'field', 'value', 'destination'} or not isinstance(rule['field'], str) or rule['destination'] not in destinations:
+            raise ValueError('Routing rules require field/value/declared destination')
+    queue, findings = [], []
+    for doc in snapshot.documents.values():
+        if doc.issues or not any(fnmatch.fnmatchcase(doc.path, pattern) for pattern in inboxes):
+            continue
+        matches = [r for r in rules if doc.properties.get(r['field']) == r['value'] and r['field'] in doc.properties]
+        proposed = sorted({r['destination'] for r in matches})
+        scope = doc.properties.get('scope')
+        allowed = [p for p in proposed if isinstance(scope, str) and destinations[p]['scope'] == scope]
+        if len(proposed) != len(allowed):
+            reason, destination = 'scope_unknown_or_mismatch', None
+        elif len(allowed) == 1:
+            reason, destination = 'explicit_metadata', allowed[0]
+        elif len(allowed) > 1:
+            reason, destination = 'ambiguous_routes', None
+        else:
+            reason, destination = 'no_explicit_route', None
+        # A vanished/renamed folder is a stale proposal, not an invented new topic.
+        if destination and not (snapshot.root / destination).is_dir():
+            reason, destination = 'destination_missing', None
+        if destination:
+            target = snapshot.root / destination
+            if (not target.resolve().is_relative_to(snapshot.root)
+                    or any(p.is_symlink() for p in [target, *target.parents] if p.is_relative_to(snapshot.root))
+                    or snapshot.policy.excludes(destination)):
+                reason, destination = 'destination_excluded', None
+        row = {'source': doc.path, 'revision': doc.revision, 'destination': destination,
+               'decision': 'preview_move' if destination else 'leave_in_inbox', 'reason': reason,
+               'scope': scope, 'evidence': matches, 'requires_revalidation': True}
+        queue.append(row)
+        findings.append(finding(doc, 'triage.route' if destination else 'triage.abstain', 'route', row))
+    return snapshot.report(findings, queue=queue, coverage_warning='Explicit property rules only; novel/implicit/multi-project captures require review. No files are moved.')
