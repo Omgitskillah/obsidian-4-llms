@@ -15,10 +15,14 @@ class State:
         self.path = path.absolute()
         if self.path.suffix not in {'.sqlite3', '.db'}:
             raise ValueError('State path must end in .sqlite3 or .db')
-        root = snapshot.root
+        original = self.path
+        if any(Path(str(original)+suffix).is_symlink() for suffix in ('', '-wal', '-shm')):
+            raise ValueError('State database path cannot contain symlinks')
+        self.path = original.resolve()
+        root = snapshot.root.resolve()
         if self.path.is_relative_to(root) and not snapshot.policy.excludes(self.path.relative_to(root).as_posix()):
             raise ValueError('State database must be outside authored notes or excluded by policy')
-        if any(p.is_symlink() for p in [self.path, *self.path.parents]):
+        if any(p.is_symlink() for p in [self.path, Path(str(self.path)+'-wal'), Path(str(self.path)+'-shm')]):
             raise ValueError('State database path cannot contain symlinks')
         self.path.parent.mkdir(parents=True, exist_ok=True)
         existed = self.path.exists()

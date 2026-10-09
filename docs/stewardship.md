@@ -184,16 +184,26 @@ revisions and last reconciliation are exposed by `maintenance_status(conn, cfg)`
 The queue is reconstructed from vault/index state after restart; cancellation
 leaves uncommitted notes pending. No independent competing vector index is added.
 
-`refresh(..., force_hash=True)` catches changed bytes with unchanged mtimes. Nuru's
-existing worker now uses this reconciliation on every pass and exposes `status`,
-`last_success`, and a `paused` Event that yields between notes. This increases
-no-change file reads but performs zero no-change embeddings. Lexical tools remain
-independent of semantic availability. Lock/corruption errors are retried by the
-existing worker; no automatic destructive database reset is introduced. Connections
-reject unrelated schemas and symlinked database/sidecar paths before writes; root
-identity prevents reuse for another vault after reconciliation. Use canonical
-paths. Lock waiting is bounded to one second. A mid-embedding edit preserves the
-old complete indexed revision and pending/error state for reconciliation.
+Indexing compares mtime, size and ctime before reading unchanged notes. Each pass
+also hashes a required rolling slice of at most 100 notes, with a persisted cursor:
+a stable N-note vault receives full byte coverage within ceil(N/100) completed
+passes (30 seconds per Nuru pass, plus processing time). Windows creation time and
+unreliable network timestamps therefore do not defeat reconciliation. Legacy rows
+with missing signatures are read once. `force_hash=True` still requests a full pass,
+but Nuru no longer uses it on every poll. Unchanged signatures and pending queues
+are not rewritten; changed signatures are updated in one transaction.
+
+Original bytes supply revisions; invalid UTF-8 is decoded with replacement for
+embedding. Unreadable or concurrently edited notes stay pending with per-note
+errors while later notes progress. Provider failures still abort the pass and keep
+the last complete revision. Database connections retain the 30-second interactive
+lock timeout; Nuru's background connection yields after one second. Database files
+and WAL/SHM symlinks remain forbidden, while ancestor aliases are canonicalized
+before root/exclusion checks. Unrelated databases are never reset automatically.
+
+This round targets macOS only. Descriptor-based read/write protections are
+unchanged. Windows imports and mutation portability are explicitly deferred to a
+future work package; no Windows support or Windows CI coverage is claimed here.
 
 Nuru's 2026-10-09 readiness evaluation repeats ten Nomic v2 index sequences and
 45 query controls successfully. The retrieval contention gate **fails**: p95
@@ -225,7 +235,7 @@ is no assumption of reliable identity for every rename across filesystems.
 Only complete passes retire disappeared findings. Changed evidence reopens review.
 Config/evidence changes invalidate suppression even with unchanged source bytes.
 No identifiers are written into notes. Existing unrelated SQLite databases and
-state paths through symlinks are rejected.
+state database/sidecar symlinks are rejected; ancestor aliases are canonicalized.
 
 Explicit CLI review adds `--review-id ID --evidence-revision HASH --review-status
 acknowledged|suppressed|open` alongside `--state`. It rescans before revision-checked

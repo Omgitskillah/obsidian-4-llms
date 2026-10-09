@@ -196,20 +196,24 @@ def ollama_embedder(config: Config) -> Embed:
 
 
 def vault_notes(vault: Path, exclusions: tuple[str, ...] = ()) -> list[Path]:
-    """Every note the semantic index covers, sorted by path (see _SKIPPED_FOLDERS)."""
+    """Eligible notes; prune excluded/symlink directories once per traversal.
 
-    def indexable(path: Path) -> bool:
-        parts = path.relative_to(vault).parts
-        if (parts[0] in _SKIPPED_FOLDERS or any(part.startswith(".") for part in parts)
-                or Policy(exclusions=exclusions).excludes(path.relative_to(vault).as_posix())
-                or any(p.is_symlink() for p in [path, *path.parents] if p.is_relative_to(vault))):
-            return False
-        try:
-            return path.resolve().is_relative_to(vault)
-        except OSError:
-            return False
-
-    return sorted(p for p in vault.rglob("*.md") if indexable(p))
+    Actual reads still pin and validate parent descriptors against swaps.
+    """
+    policy = Policy(exclusions=exclusions)
+    notes = []
+    for base, directories, files in os.walk(vault, followlinks=False):
+        parent = Path(base)
+        directories[:] = [name for name in directories
+                          if not name.startswith('.')
+                          and not (parent == vault and name in _SKIPPED_FOLDERS)
+                          and not (parent / name).is_symlink()
+                          and not policy.excludes((parent / name).relative_to(vault).as_posix())]
+        for name in files:
+            path = parent / name
+            if name.endswith('.md') and not path.is_symlink() and not policy.excludes(path.relative_to(vault).as_posix()):
+                notes.append(path)
+    return sorted(notes)
 
 
 def _sections(body: str) -> list[tuple[str | None, list[str]]]:
@@ -292,10 +296,13 @@ def connect(config: Config) -> sqlite3.Connection:
     WAL mode, so the server can search while Nuru's indexer writes.
     """
     path = config.db_path.absolute()
-    if any(p.is_symlink() for p in [path, *path.parents, Path(str(path)+'-wal'), Path(str(path)+'-shm')]):
+    if any(p.is_symlink() for p in [path, Path(str(path)+'-wal'), Path(str(path)+'-shm')]):
         raise ValueError('Semantic database path cannot contain symlinks')
-    config.db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(config.db_path, timeout=1)
+    path = path.resolve()
+    if any(Path(str(path)+suffix).is_symlink() for suffix in ('-wal', '-shm')):
+        raise ValueError('Semantic database sidecar cannot contain symlinks')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path, timeout=30)
     try:
         # Inspect before changing journal mode or adding tables. Legacy semantic
         # indexes are accepted by their schema; unrelated databases are untouched.
@@ -310,6 +317,10 @@ def connect(config: Config) -> sqlite3.Connection:
         conn.enable_load_extension(False)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(_SCHEMA)
+        columns = {row[1] for row in conn.execute('PRAGMA table_info(notes)')}
+        for column in ('size', 'ctime_ns'):
+            if column not in columns:
+                conn.execute(f'ALTER TABLE notes ADD COLUMN {column} INTEGER')
     except Exception:
         conn.close()
         raise
@@ -383,6 +394,8 @@ class _Note:
     mtime_ns: int
     hash: str
     text: str
+    size: int
+    ctime_ns: int
 
 
 @dataclass
@@ -392,6 +405,7 @@ class RefreshResult:
     removed: list[str] = field(default_factory=list)
     pending: list[str] = field(default_factory=list)
     interrupted: bool = False
+    errors: dict[str, str] = field(default_factory=dict)
 
 
 def _delete_note(conn: sqlite3.Connection, path: str, has_vectors: bool) -> None:
@@ -409,6 +423,14 @@ def _ensure_vectors(conn: sqlite3.Connection, dims: int) -> None:
         conn.execute("INSERT INTO meta (key, value) VALUES ('dims', ?)", (str(dims),))
     elif int(stored) != dims:
         raise ValueError(f"The embedder returned {dims}-dimensional vectors, but the index holds {stored}.")
+
+
+class NoteChanged(ValueError):
+    """A busy note stays pending without starving later notes."""
+
+
+def _read_note(root: Path, path: Path) -> bytes:
+    return mutations.read(root, path)
 
 
 def refresh(
@@ -432,39 +454,58 @@ def refresh(
     should_stop() is checked between notes, to end a long refresh early.
     """
     _check_compatible(conn, config)
+    meta = _meta(conn)
+    def put_meta(key, value):
+        if meta.get(key) != value:
+            conn.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)", (key, value))
+            meta[key] = value
     with conn:
-        conn.execute("INSERT OR IGNORE INTO meta (key,value) VALUES ('vault_root',?)", (str(config.vault.resolve()),))
-        conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('model', ?)", (config.model,))
-        conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('chunk_chars', ?)", (str(config.chunk_chars),))
-        for key, value in [('model_digest', config.model_digest), ('parser_version', config.parser_version), ('exclusions', json.dumps(config.exclusions))]:
-            conn.execute('INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)', (key, value))
-    has_vectors = "dims" in _meta(conn)
-    known = {row[0]: row for row in conn.execute("SELECT path, title, mtime_ns, hash FROM notes")}
+        for key, value in [('vault_root', str(config.vault.resolve())), ('model', config.model),
+                           ('chunk_chars', str(config.chunk_chars)), ('model_digest', config.model_digest),
+                           ('parser_version', config.parser_version), ('exclusions', json.dumps(config.exclusions))]:
+            put_meta(key, value)
+    has_vectors = "dims" in meta
+    known = {row[0]: row for row in conn.execute("SELECT path, title, mtime_ns, hash, size, ctime_ns FROM notes")}
     ids = _read_ids(config.vault)
     result = RefreshResult()
-
     changed: list[_Note] = []
     seen: set[str] = set()
-    for path in vault_notes(config.vault, config.exclusions):
-        rel = str(path.relative_to(config.vault))
+    paths = vault_notes(config.vault, config.exclusions)
+    # Required on every platform: signatures cannot prove unchanged bytes (notably Windows ctime).
+    # Persist a cursor so at most 100 otherwise unchanged notes are read per pass.
+    cursor = int(meta.get('hash_cursor', '0')) % max(1, len(paths))
+    count = min(100, len(paths))
+    reconcile = {(cursor + i) % len(paths) for i in range(count)} if paths else set()
+    signatures = []
+    for position, path in enumerate(paths):
+        rel = path.relative_to(config.vault).as_posix()
         seen.add(rel)
-        mtime_ns = path.stat().st_mtime_ns
         old = known.get(rel)
-        if old is not None and old[2] == mtime_ns and not force_hash:
+        try:
+            before = path.stat()
+            signature = (before.st_mtime_ns, before.st_size, before.st_ctime_ns)
+            if old is not None and (old[2], old[4], old[5]) == signature and not force_hash and position not in reconcile:
+                continue
+            data = _read_note(config.vault, path)
+            after = path.stat()
+            if (before.st_ino, *signature) != (after.st_ino, after.st_mtime_ns, after.st_size, after.st_ctime_ns):
+                raise NoteChanged(f'Note changed during index read: {rel}')
+        except (OSError, ValueError) as exc:
+            result.errors[rel] = f'{type(exc).__name__}: {exc}'
             continue
-        before = path.stat()
-        text = mutations.read(config.vault, path).decode('utf-8')
-        after = path.stat()
-        if (before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns):
-            raise ValueError(f'Note changed during index read: {rel}')
-        digest = hashlib.sha256(text.encode()).hexdigest()
+        digest = hashlib.sha256(data).hexdigest()
         if old is not None and old[3] == digest:
-            with conn:
-                conn.execute("UPDATE notes SET mtime_ns = ? WHERE path = ?", (mtime_ns, rel))
+            if (old[2], old[4], old[5]) != signature:
+                signatures.append((*signature, rel))
             continue
+        text = data.decode('utf-8', errors='replace')
         info = ids.get(rel, {})
         note_id = info.get("id") or _frontmatter_id(text)
-        changed.append(_Note(rel, info.get("title") or path.stem, note_id, mtime_ns, digest, text))
+        changed.append(_Note(rel, info.get("title") or path.stem, note_id, before.st_mtime_ns, digest, text,
+                             before.st_size, before.st_ctime_ns))
+    with conn:
+        conn.executemany("UPDATE notes SET mtime_ns=?,size=?,ctime_ns=? WHERE path=?", signatures)
+        put_meta('hash_cursor', str((cursor + count) % max(1, len(paths))))
 
     gone = {rel: row for rel, row in known.items() if rel not in seen}
     for note in list(changed):
@@ -475,8 +516,8 @@ def refresh(
             continue
         with conn:
             conn.execute(
-                "UPDATE notes SET path = ?, note_id = ?, mtime_ns = ? WHERE path = ?",
-                (note.path, note.note_id, note.mtime_ns, source),
+                "UPDATE notes SET path = ?, note_id = ?, mtime_ns = ?, size = ?, ctime_ns = ? WHERE path = ?",
+                (note.path, note.note_id, note.mtime_ns, note.size, note.ctime_ns, source),
             )
             conn.execute("UPDATE chunks SET path = ? WHERE path = ?", (note.path, source))
         del gone[source]
@@ -488,15 +529,18 @@ def refresh(
             _delete_note(conn, rel, has_vectors)
     result.removed = sorted(gone)
 
-    result.pending = [n.path for n in changed]
+    result.pending = [n.path for n in changed] + sorted(result.errors)
     def record_pending():
         with conn:
-            if result.pending and not _meta(conn).get('pending_since'):
-                conn.execute("INSERT OR REPLACE INTO meta (key,value) VALUES ('pending_since',?)", (str(time.time()),))
-            if not result.pending:
+            if result.pending and not meta.get('pending_since'):
+                put_meta('pending_since', str(time.time()))
+            if not result.pending and 'pending_since' in meta:
                 conn.execute("DELETE FROM meta WHERE key='pending_since'")
-            conn.execute("INSERT OR REPLACE INTO meta (key,value) VALUES ('pending',?)", (json.dumps(result.pending),))
-            conn.execute("INSERT OR REPLACE INTO meta (key,value) VALUES ('queue_updated',?)", (str(time.time()),))
+                meta.pop('pending_since', None)
+            pending = json.dumps(result.pending)
+            if meta.get('pending') != pending:
+                put_meta('pending', pending)
+                put_meta('queue_updated', str(time.time()))
     record_pending()
 
     for done, note in enumerate(changed):
@@ -516,9 +560,15 @@ def refresh(
                 raise ValueError('Embedder returned mixed vector dimensions')
             if len(vectors) != len(chunks):
                 raise ValueError(f"The embedder returned {len(vectors)} vectors for {len(chunks)} chunks.")
-            current = mutations.read(config.vault, config.vault / note.path)
+            try:
+                current = _read_note(config.vault, config.vault / note.path)
+            except OSError as exc:
+                raise NoteChanged(f'Note unavailable during embedding: {note.path}') from exc
             if hashlib.sha256(current).hexdigest() != note.hash:
-                raise ValueError(f'Note changed during embedding: {note.path}')
+                raise NoteChanged(f'Note changed during embedding: {note.path}')
+        except NoteChanged as exc:
+            result.errors[note.path] = f'{type(exc).__name__}: {exc}'
+            continue
         except Exception as exc:
             with conn:
                 conn.execute("INSERT OR REPLACE INTO meta (key,value) VALUES ('last_error',?)", (f'{type(exc).__name__}: {exc}',))
@@ -529,8 +579,8 @@ def refresh(
                 has_vectors = True
             _delete_note(conn, note.path, has_vectors)
             conn.execute(
-                "INSERT INTO notes (path, note_id, title, mtime_ns, hash) VALUES (?, ?, ?, ?, ?)",
-                (note.path, note.note_id, note.title, note.mtime_ns, note.hash),
+                "INSERT INTO notes (path, note_id, title, mtime_ns, hash, size, ctime_ns) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (note.path, note.note_id, note.title, note.mtime_ns, note.hash, note.size, note.ctime_ns),
             )
             for chunk, vector in zip(chunks, vectors):
                 chunk_id = conn.execute("INSERT INTO chunks (path, text) VALUES (?, ?)", (note.path, chunk)).lastrowid
@@ -544,7 +594,10 @@ def refresh(
     with conn:
         if not result.interrupted:
             conn.execute("INSERT OR REPLACE INTO meta (key,value) VALUES ('last_reconciliation',?)", (str(time.time()),))
-            conn.execute("DELETE FROM meta WHERE key='last_error'")
+            if result.errors:
+                put_meta('last_error', json.dumps(result.errors, sort_keys=True))
+            elif 'last_error' in meta:
+                conn.execute("DELETE FROM meta WHERE key='last_error'")
     if on_progress is not None:
         on_progress(0)
     return result

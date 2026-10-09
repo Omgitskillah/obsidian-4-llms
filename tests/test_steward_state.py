@@ -126,3 +126,25 @@ def test_empty_existing_database_not_adopted(tmp_path):
     with pytest.raises(ValueError, match='unrelated'):
         State(path, Steward(tmp_path, CONFIG).snapshot)
     assert path.read_bytes() == b''
+
+
+def test_state_alias_is_canonicalized_before_authored_path_check(tmp_path):
+    runner = Steward(tmp_path, CONFIG)
+    alias = tmp_path / 'alias'
+    alias.symlink_to(tmp_path, target_is_directory=True)
+    with pytest.raises(ValueError, match='excluded'):
+        State(alias / 'notes.sqlite3', runner.snapshot)
+    state = State(alias / '.state.sqlite3', runner.snapshot)
+    assert state.path == tmp_path / '.state.sqlite3'
+    state.close()
+
+
+@pytest.mark.parametrize('suffix', ['-wal', '-shm'])
+def test_state_sidecar_symlink_cannot_write_outside_database(tmp_path, suffix):
+    runner = Steward(tmp_path, CONFIG)
+    outside = tmp_path / 'preserve'
+    outside.write_bytes(b'preserve me')
+    (tmp_path / ('.state.sqlite3' + suffix)).symlink_to(outside)
+    with pytest.raises(ValueError, match='symlink'):
+        State(tmp_path / '.state.sqlite3', runner.snapshot)
+    assert outside.read_bytes() == b'preserve me'

@@ -80,8 +80,8 @@ def test_edit_during_embedding_does_not_publish_stale_revision(tmp_path):
     def concurrent(texts):
         (root/'a.md').write_text('Second edit while inference runs.\n')
         return embed(texts)
-    with pytest.raises(ValueError,match='changed during embedding'):
-        semantic.refresh(conn,config,concurrent,force_hash=True)
+    result = semantic.refresh(conn,config,concurrent,force_hash=True)
+    assert result.pending == ['a.md']
     status=semantic.maintenance_status(conn,config)
     assert status['indexed_revisions']['a.md'] == old and status['pending'] == ['a.md']
     assert 'changed during embedding' in status['last_error']
