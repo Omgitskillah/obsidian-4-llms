@@ -2525,6 +2525,24 @@ def test_write_note_leaves_proper_tasks_code_and_link_definitions_as_written(tmp
     assert (tmp_path / result["path"]).read_text().endswith(content)
 
 
+@pytest.mark.parametrize("code", [
+    "````markdown\n```\n[ ] literal example\n```\n[x] still the example\n````",
+    "- a list item\n\n    ```\n    [ ] literal example\n    ```",
+    "Paragraph.\n\n    [ ] literal example\n    [x] indented code",
+    "> ~~~~\n> [ ] literal example\n> ~~~~",
+    "<pre>\n[ ] literal example\n</pre>",
+])
+def test_write_note_leaves_checkboxes_in_any_code_block_as_written(tmp_path, monkeypatch, code):
+    """Review of #4: a four-backtick fence around a three-backtick one, a fence nested in a list, an
+    indented code block - each a literal example that must not be rewritten."""
+    monkeypatch.setattr(server, "VAULT_PATH", tmp_path)
+    content = f"{code}\n\n[ ] a real task"
+
+    result = server.write_note(content, note="Examples")
+
+    assert (tmp_path / result["path"]).read_text().endswith(f"{code}\n\n- [ ] a real task")
+
+
 def test_write_note_tells_the_model_how_a_task_is_written():
     import asyncio
 

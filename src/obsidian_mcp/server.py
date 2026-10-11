@@ -24,6 +24,7 @@ import yaml
 from access_logging import AccessLogMiddleware
 from unidecode import unidecode
 from dotenv import load_dotenv
+from markdown_it import MarkdownIt
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
@@ -1912,17 +1913,16 @@ _BARE_CHECKBOX = re.compile(r"^(\s*)(\[[ xX]\])(?=\s)")
 
 
 def _task_list_items(content: str) -> str:
-    """`content` with every bare checkbox line outside fenced code made a list item: "[ ] a" -> "- [ ] a",
-    "[x] b" -> "- [x] b", indentation kept."""
+    """`content` with every bare checkbox line outside code made a list item: "[ ] a" -> "- [ ] a",
+    "[x] b" -> "- [x] b", indentation kept. Code is what markdown-it parses as a fence (any length, nested
+    in lists or quotes), an indented code block or an HTML block, so literal examples stay as written."""
     lines = content.split("\n")
-    fence: str | None = None
+    code: set[int] = set()
+    for token in MarkdownIt("commonmark").parse(content):
+        if token.type in {"fence", "code_block", "html_block"} and token.map:
+            code.update(range(*token.map))
     for i, line in enumerate(lines):
-        if opening := _CODE_FENCE.match(line):
-            if fence is None:
-                fence = opening.group(1)
-            elif opening.group(1) == fence:
-                fence = None
-        elif fence is None:
+        if i not in code:
             lines[i] = _BARE_CHECKBOX.sub(r"\1- \2", line)
     return "\n".join(lines)
 
