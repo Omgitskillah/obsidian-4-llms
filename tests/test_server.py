@@ -2503,6 +2503,54 @@ def test_add_to_daily_creates_todays_daily_when_there_is_none(tmp_path, monkeypa
     assert "# Daily 2026-09-20\n\n- 09:00 Coffee" in text
 
 
+def test_write_note_makes_bare_checkboxes_list_items_so_obsidian_and_note_todos_see_them(tmp_path, monkeypatch):
+    """A small model wrote "[ ] task" in a daily (2026-10-11): Obsidian showed it as text, note_todos missed it."""
+    monkeypatch.setattr(server, "VAULT_PATH", tmp_path)
+    _today_is(monkeypatch, "2026-10-11")
+
+    result = server.write_note("# Today\n\n[ ] Confirm the appointment\n[x] Book it\n  [ ] Bring forms", type="daily")
+
+    text = (tmp_path / result["path"]).read_text()
+    assert "- [ ] Confirm the appointment\n- [x] Book it\n  - [ ] Bring forms" in text
+    assert [todo["text"] for todo in server.note_todos(result["path"])["todos"]] == [
+        "- [ ] Confirm the appointment", "- [ ] Bring forms"]
+
+
+def test_write_note_leaves_proper_tasks_code_and_link_definitions_as_written(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "VAULT_PATH", tmp_path)
+    content = "- [ ] a\n* [x] b\n1. [ ] c\n```\n[ ] in code\n```\n[x]: https://example.com\nsee [x] above"
+
+    result = server.write_note(content, note="Tasks")
+
+    assert (tmp_path / result["path"]).read_text().endswith(content)
+
+
+@pytest.mark.parametrize("code", [
+    "````markdown\n```\n[ ] literal example\n```\n[x] still the example\n````",
+    "- a list item\n\n    ```\n    [ ] literal example\n    ```",
+    "Paragraph.\n\n    [ ] literal example\n    [x] indented code",
+    "> ~~~~\n> [ ] literal example\n> ~~~~",
+    "<pre>\n[ ] literal example\n</pre>",
+])
+def test_write_note_leaves_checkboxes_in_any_code_block_as_written(tmp_path, monkeypatch, code):
+    """Review of #4: a four-backtick fence around a three-backtick one, a fence nested in a list, an
+    indented code block - each a literal example that must not be rewritten."""
+    monkeypatch.setattr(server, "VAULT_PATH", tmp_path)
+    content = f"{code}\n\n[ ] a real task"
+
+    result = server.write_note(content, note="Examples")
+
+    assert (tmp_path / result["path"]).read_text().endswith(f"{code}\n\n- [ ] a real task")
+
+
+def test_write_note_tells_the_model_how_a_task_is_written():
+    import asyncio
+
+    tool = next(t for t in asyncio.run(server.mcp.list_tools()) if t.name == "write_note")
+
+    assert "'- [ ] call Dana'" in tool.description
+
+
 def test_add_to_daily_returns_the_id_of_the_note_it_created(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "VAULT_PATH", tmp_path)
     _today_is(monkeypatch, "2026-09-20")

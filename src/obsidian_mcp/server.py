@@ -24,6 +24,7 @@ import yaml
 from access_logging import AccessLogMiddleware
 from unidecode import unidecode
 from dotenv import load_dotenv
+from markdown_it import MarkdownIt
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
@@ -1906,6 +1907,26 @@ def _correction_targets(content: str) -> list[str]:
     return targets
 
 
+# A checkbox written without its list marker ("[ ] call Dana"): Obsidian shows it as plain text and
+# note_todos can't see it. write_note makes it a list item. Not "[x]: url", a link definition.
+_BARE_CHECKBOX = re.compile(r"^(\s*)(\[[ xX]\])(?=\s)")
+
+
+def _task_list_items(content: str) -> str:
+    """`content` with every bare checkbox line outside code made a list item: "[ ] a" -> "- [ ] a",
+    "[x] b" -> "- [x] b", indentation kept. Code is what markdown-it parses as a fence (any length, nested
+    in lists or quotes), an indented code block or an HTML block, so literal examples stay as written."""
+    lines = content.split("\n")
+    code: set[int] = set()
+    for token in MarkdownIt("commonmark").parse(content):
+        if token.type in {"fence", "code_block", "html_block"} and token.map:
+            code.update(range(*token.map))
+    for i, line in enumerate(lines):
+        if i not in code:
+            lines[i] = _BARE_CHECKBOX.sub(r"\1- \2", line)
+    return "\n".join(lines)
+
+
 _TYPE_LINES = "; ".join(f"{name} = {what}" for name, what in template.TYPE_DESCRIPTIONS.items())
 
 
@@ -1913,7 +1934,8 @@ _TYPE_LINES = "; ".join(f"{name} = {what}" for name, what in template.TYPE_DESCR
     description=(
         "Write to a note, creating it if it doesn't exist. note: an existing note's path, title or id; or, for "
         "a new note, a title (it goes in nuru/) or a path under nuru/ or shared/ such as 'nuru/People/Dana Lee' "
-        "(folders are made as needed). content: Markdown. mode: 'append' (default) adds content to the end - send "
+        "(folders are made as needed). content: Markdown; a task is a list item with a checkbox, '- [ ] call Dana' "
+        "('- [x]' when done). mode: 'append' (default) adds content to the end - send "
         "ONLY the new text. For replace, first call read_note with include_revision=true and supply its revision as expected_revision. "
         "'replace' makes content the note's whole new text "
         "(frontmatter kept), so send the complete note - only for notes in nuru/, and the old version is kept. "
@@ -1963,6 +1985,10 @@ def write_note(
     change existing text, so every guard below applies to it too. Replacing
     with nothing is refused: that is a delete, which is a move to trash.
 
+    A checkbox line without its list marker ("[ ] task") is made a list item
+    ("- [ ] task"), outside fenced code (_task_list_items): otherwise Obsidian
+    shows it as text and note_todos misses it.
+
     Guards against the ways a write lands somewhere it shouldn't:
     - An id that matches nothing is refused, with the closest notes.
     - A new note whose name is all but an existing note's (see _near_names) is
@@ -1987,6 +2013,7 @@ def write_note(
     _check_accessible(VAULT_PATH)
     if mode not in _WRITE_MODES:
         raise ValueError(f"Unknown mode '{mode}'. Use 'append' to add to the end, or 'replace' to rewrite the note.")
+    content = _task_list_items(content)
 
     if type == "daily":
         today = _today()
