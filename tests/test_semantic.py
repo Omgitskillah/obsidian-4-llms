@@ -406,6 +406,63 @@ def test_ollama_embedder_explains_a_missing_model(tmp_path, monkeypatch):
         embed(["a"])
 
 
+def test_ollama_embedder_says_when_a_text_is_longer_than_the_models_context(tmp_path, monkeypatch):
+    def fake_urlopen(request, timeout):
+        raise urllib.error.HTTPError(request.full_url, 400, "Bad Request", {},
+                                     io.BytesIO(b'{"error":"the input length exceeds the context length"}'))
+
+    monkeypatch.setattr(semantic.urllib.request, "urlopen", fake_urlopen)
+    embed = semantic.ollama_embedder(semantic.load_config(tmp_path, {}))
+
+    with pytest.raises(semantic.InputTooLong):
+        embed(["a"])
+
+
+class ShortWindowEmbed(FakeEmbed):
+    """A model with a small context: it rejects any text longer than `limit` characters, as Ollama
+    does for nomic-embed-text-v2-moe's 512 tokens."""
+
+    def __init__(self, limit):
+        super().__init__()
+        self.limit = limit
+
+    def __call__(self, texts):
+        if any(len(t) > self.limit for t in texts):
+            raise semantic.InputTooLong("too long")
+        return super().__call__(texts)
+
+
+def test_a_chunk_too_long_for_the_model_is_split_not_cut_and_the_rest_of_the_vault_is_indexed(vault):
+    table = "| Feature | Score |\n| --- | --- |\n" + "".join(f"| Feature {i} with a long name | {i} |\n" for i in range(30))
+    assert len(table) < 1500, "one chunk as chunk_note cuts it, but longer than the model takes"
+    (vault / "Results.md").write_text(f"# Results\n\n{table}")
+    embed = ShortWindowEmbed(400)
+
+    result = refresh(vault, embed)
+
+    assert "Results.md" in result.embedded and not result.errors
+    config = semantic.load_config(vault, {})
+    with contextlib.closing(semantic.connect(config)) as conn:
+        chunks = [row[0] for row in conn.execute("SELECT text FROM chunks WHERE path = 'Results.md' ORDER BY id")]
+    assert len(chunks) > 1 and all(c.startswith("Results\n\n") for c in chunks), "each part keeps its label"
+    assert all(len(semantic._DOCUMENT_PREFIX + c) <= 400 for c in chunks)
+    rows = [line for c in chunks for line in c.split("\n\n", 1)[1].splitlines()]
+    assert rows == table.strip().splitlines(), "every row is indexed, none cut off or repeated"
+    assert set(result.embedded) >= {"Garage/Vehicle upkeep.md", "Garden/Tomatoes.md"}
+
+
+def test_a_split_keeps_the_indentation_of_the_line_after_the_cut():
+    code = "```python\nif ready:\n    launch()\n    finish()\n```"
+    first, second = semantic._halves(f"Example\n\n{code}")
+    assert second == "Example\n\n    launch()\n    finish()\n```", "only the line break goes"
+    assert first.split("\n\n", 1)[1] + "\n" + second.split("\n\n", 1)[1] == code, "nothing else is lost"
+
+
+def test_a_text_that_cant_be_split_further_still_fails_loudly(vault):
+    with pytest.raises(semantic.InputTooLong):
+        refresh(vault, ShortWindowEmbed(5))
+
+
 def test_ollama_embedder_says_when_ollama_is_not_running(tmp_path, monkeypatch):
     def fake_urlopen(request, timeout):
         raise urllib.error.URLError(ConnectionRefusedError(61, "Connection refused"))
