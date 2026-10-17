@@ -159,6 +159,11 @@ def load_config(vault: Path, env: Mapping[str, str]) -> Config:
     )
 
 
+class InputTooLong(ValueError):
+    """The embedding model rejected a text as longer than its context (e.g. a dense table in a
+    model with a 512-token window). refresh() splits that chunk and embeds the parts."""
+
+
 def ollama_embedder(config: Config) -> Embed:
     """An Embed that calls the local Ollama's /api/embed with config.model.
 
@@ -183,6 +188,8 @@ def ollama_embedder(config: Config) -> Embed:
                 return json.load(response)["embeddings"]
         except urllib.error.HTTPError as e:
             detail = e.read().decode(errors="replace").strip()
+            if e.code == 400 and "exceeds the context length" in detail:
+                raise InputTooLong(f"'{config.model}' can't embed a text this long ({detail}).") from e
             raise ValueError(
                 f"Ollama could not embed with '{config.model}' ({e.code}: {detail}). "
                 f"If the model is missing, run `ollama pull {config.model}`."
@@ -288,6 +295,53 @@ def chunk_note(title: str, text: str, chunk_chars: int) -> list[str]:
         pieces = [piece for paragraph in paragraphs for piece in _pieces(paragraph, chunk_chars)]
         chunks.extend(f"{label}\n\n{passage}" for passage in _pack(pieces, chunk_chars, "\n\n"))
     return chunks
+
+
+def _halves(chunk: str) -> list[str] | None:
+    """A chunk as two, its label line on both, its passage split at the line break nearest the
+    middle (else a space, else the middle). None if the passage is too short to split."""
+    label, _, passage = chunk.partition("\n\n")
+    if not passage:
+        label, passage = "", chunk
+    if len(passage) < 2:
+        return None
+    middle = len(passage) // 2
+    cut = middle
+    for sep in ("\n", " "):  # a line break if there is one, so a table row or list item stays whole
+        found = [i for i in (passage.rfind(sep, 0, middle), passage.find(sep, middle)) if i > 0]
+        if found:
+            cut = min(found, key=lambda i: abs(i - middle))
+            break
+    parts = [passage[:cut].strip(), passage[cut:].strip()]
+    if not all(parts):
+        parts = [passage[:middle], passage[middle:]]
+    return [f"{label}\n\n{part}" if label else part for part in parts]
+
+
+def _embed_fitting(embed: Embed, chunks: list[str], batch: int) -> tuple[list[str], list]:
+    """Embed `chunks` as search documents, `batch` at a time. A chunk the model rejects as too long
+    is split in two (_halves) and its parts embedded instead, again if need be: nothing is cut off,
+    and one dense passage doesn't stop the rest of the note or the vault. Returns the chunks as
+    embedded, and their vectors."""
+    out, vectors = [], []
+    for offset in range(0, len(chunks), batch):
+        part = chunks[offset:offset + batch]
+        try:
+            got = embed([_DOCUMENT_PREFIX + c for c in part])
+        except InputTooLong:
+            if len(part) == 1:
+                halves = _halves(part[0])
+                if halves is None:
+                    raise
+                done = _embed_fitting(embed, halves, 1)
+            else:
+                done = _embed_fitting(embed, part, 1)
+            out.extend(done[0])
+            vectors.extend(done[1])
+            continue
+        out.extend(part)
+        vectors.extend(got)
+    return out, vectors
 
 
 def connect(config: Config) -> sqlite3.Connection:
@@ -551,9 +605,7 @@ def refresh(
             on_progress(len(changed) - done)
         chunks = chunk_note(note.title, note.text, config.chunk_chars)
         try:
-            vectors = []
-            for offset in range(0, len(chunks), config.batch_chunks):
-                vectors.extend(embed([_DOCUMENT_PREFIX + c for c in chunks[offset:offset + config.batch_chunks]]))
+            chunks, vectors = _embed_fitting(embed, chunks, config.batch_chunks)
             if any(not isinstance(v, (list, tuple)) or not v or any(not isinstance(x, (float, int)) or not math.isfinite(x) for x in v) for v in vectors):
                 raise ValueError('Embedder returned invalid/nonfinite vectors')
             if vectors and any(len(v) != len(vectors[0]) for v in vectors):
