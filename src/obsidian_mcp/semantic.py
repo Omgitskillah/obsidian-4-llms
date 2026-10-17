@@ -306,15 +306,15 @@ def _halves(chunk: str) -> list[str] | None:
     if len(passage) < 2:
         return None
     middle = len(passage) // 2
-    cut = middle
+    parts = [passage[:middle], passage[middle:]]
     for sep in ("\n", " "):  # a line break if there is one, so a table row or list item stays whole
         found = [i for i in (passage.rfind(sep, 0, middle), passage.find(sep, middle)) if i > 0]
         if found:
             cut = min(found, key=lambda i: abs(i - middle))
+            # only the separator goes: the next line keeps its indentation (code, nested lists)
+            if passage[:cut].strip() and passage[cut + 1:].strip():
+                parts = [passage[:cut], passage[cut + 1:]]
             break
-    parts = [passage[:cut].strip(), passage[cut:].strip()]
-    if not all(parts):
-        parts = [passage[:middle], passage[middle:]]
     return [f"{label}\n\n{part}" if label else part for part in parts]
 
 

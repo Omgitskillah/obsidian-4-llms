@@ -451,6 +451,13 @@ def test_a_chunk_too_long_for_the_model_is_split_not_cut_and_the_rest_of_the_vau
     assert set(result.embedded) >= {"Garage/Vehicle upkeep.md", "Garden/Tomatoes.md"}
 
 
+def test_a_split_keeps_the_indentation_of_the_line_after_the_cut():
+    code = "```python\nif ready:\n    launch()\n    finish()\n```"
+    first, second = semantic._halves(f"Example\n\n{code}")
+    assert second == "Example\n\n    launch()\n    finish()\n```", "only the line break goes"
+    assert first.split("\n\n", 1)[1] + "\n" + second.split("\n\n", 1)[1] == code, "nothing else is lost"
+
+
 def test_a_text_that_cant_be_split_further_still_fails_loudly(vault):
     with pytest.raises(semantic.InputTooLong):
         refresh(vault, ShortWindowEmbed(5))
