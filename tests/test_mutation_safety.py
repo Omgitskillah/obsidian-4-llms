@@ -157,6 +157,32 @@ def test_a_directory_swapped_mid_write_cannot_redirect_it(vault, tmp_path, monke
         assert (vault / "old-nuru/new.md").read_bytes() == b"inside"
 
 
+def test_a_folder_above_the_vault_swapped_mid_write_cannot_redirect_it(tmp_path, monkeypatch):
+    """The vault's parent folder (Documents\\Vaults for ...\\Vaults\\MyVault) is renamed away mid-write and a
+    link put in its place, leading to a look-alike vault. Windows refuses the rename while the vault is
+    held open; POSIX allows it, but every step goes through the vault's pinned descriptor."""
+    root = tmp_path / "Vaults" / "MyVault"
+    (root / "nuru").mkdir(parents=True)
+    decoy = tmp_path / "decoy"
+    (decoy / "MyVault" / "nuru").mkdir(parents=True)
+    real_stage, refused = mutations._stage, []
+    def swap(fd, data, mode):
+        try:
+            (tmp_path / "Vaults").rename(tmp_path / "Vaults-old")
+        except PermissionError:
+            refused.append(True)
+        else:
+            _link_directory(tmp_path / "Vaults", decoy)
+        return real_stage(fd, data, mode)
+    monkeypatch.setattr(mutations, "_stage", swap)
+    mutations.create(root, root / "nuru/new.md", b"inside")
+    assert not list((decoy / "MyVault" / "nuru").iterdir())
+    if sys.platform == "win32":
+        assert refused and (root / "nuru/new.md").read_bytes() == b"inside"
+    else:
+        assert (tmp_path / "Vaults-old" / "MyVault" / "nuru/new.md").read_bytes() == b"inside"
+
+
 def test_read_only_rejects_every_mutation_but_allows_reading(vault, monkeypatch):
     monkeypatch.setenv("OBSIDIAN_READ_ONLY", "1")
     for call in (

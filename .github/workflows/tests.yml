@@ -1,8 +1,15 @@
 name: Tests
 
 on:
+  # Once per change: a pull request's branch, then main when it merges. Runs cost minutes.
   push:
+    branches: [main]
   pull_request:
+
+# A newer push to the same branch or pull request makes the older run pointless.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   tests:
