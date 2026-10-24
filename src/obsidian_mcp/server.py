@@ -2041,7 +2041,7 @@ def write_note(
                     message += f" Closest matches: {', '.join(_rel(p) for p in close)}."
                 raise FileNotFoundError(f"{message} To make a new note, pass a title or a path as note.")
             name = note.strip().removesuffix(".md")
-            folder, title = (str(Path(name).parent), Path(name).name) if "/" in name else (None, name)
+            folder, title = (Path(name).parent.as_posix(), Path(name).name) if "/" in name else (None, name)
             if near := _near_names(_slugify(title)):
                 raise FileExistsError(
                     f"No note is at '{note}', but {', '.join(_rel(p) for p in near[:3])} has nearly the same name. "

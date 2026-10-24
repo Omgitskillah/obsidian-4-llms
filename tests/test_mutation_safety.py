@@ -56,6 +56,7 @@ def test_update_rechecks_revision_immediately_before_commit(vault, monkeypatch):
     assert path.read_bytes() == b"newer user data"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows file modes have no group or other bits")
 def test_append_is_atomic_and_preserves_permissions(vault):
     path = vault / "nuru/plan.md"
     path.chmod(0o640)

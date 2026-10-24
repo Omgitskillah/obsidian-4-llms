@@ -4,6 +4,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import sys
 from datetime import datetime
 
 import pytest
@@ -26,7 +27,7 @@ def _files():
     """Every visible file outside trash/, as vault-relative paths (what list_files returned)."""
     root = server.VAULT_PATH
     return sorted(
-        str(p.relative_to(root)) for p in root.rglob("*")
+        p.relative_to(root).as_posix() for p in root.rglob("*")
         if p.is_file() and server._is_visible(p) and not server._is_trashed(p)
     )
 
@@ -125,6 +126,7 @@ def test_list_files_in_directory_finds_first_nested_match_by_name(tmp_path, monk
     assert server._folder_listing("folder")["files"] == ["Projects/folder/a.md"]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows can't take read access away with chmod")
 def test_browse_raises_clear_error_on_a_locked_folder(tmp_path, monkeypatch):
     import os
 
@@ -364,6 +366,7 @@ def test_read_note_raises_if_missing(tmp_path, monkeypatch):
         server.read_note("NoSuchNote")
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows can't take read access away with chmod")
 def test_read_note_raises_clear_error_on_permission_denied(tmp_path, monkeypatch):
     import os
 

@@ -155,7 +155,7 @@ def test_vault_notes_skip_templates_trash_hidden_folders_and_symlinks_out_but_ke
     outside.write_text("secret")
     (vault / "leak.md").symlink_to(outside)
 
-    paths = [str(p.relative_to(vault)) for p in semantic.vault_notes(vault)]
+    paths = [p.relative_to(vault).as_posix() for p in semantic.vault_notes(vault)]
 
     assert paths == ["Garage/Vehicle upkeep.md", "Garden/Tomatoes.md", "Kitchen/Sourdough.md", "user/Budget.md"]
 
@@ -165,7 +165,7 @@ def test_vault_notes_follow_whatever_folders_the_vault_has(tmp_path):
     (tmp_path / "a" / "b" / "c" / "deep.md").write_text("deep")
     (tmp_path / "top.md").write_text("top")
 
-    assert [str(p.relative_to(tmp_path)) for p in semantic.vault_notes(tmp_path)] == ["a/b/c/deep.md", "top.md"]
+    assert [p.relative_to(tmp_path).as_posix() for p in semantic.vault_notes(tmp_path)] == ["a/b/c/deep.md", "top.md"]
 
 
 # --- load_config ---
@@ -289,7 +289,7 @@ def test_vault_notes_keep_archived_notes(tmp_path):
     (tmp_path / "archive" / "nuru").mkdir(parents=True)
     (tmp_path / "archive" / "nuru" / "old.md").write_text("old")
 
-    assert [str(p.relative_to(tmp_path)) for p in semantic.vault_notes(tmp_path)] == ["archive/nuru/old.md"]
+    assert [p.relative_to(tmp_path).as_posix() for p in semantic.vault_notes(tmp_path)] == ["archive/nuru/old.md"]
 
 
 def test_refresh_reports_how_many_notes_are_left_and_can_be_stopped_between_notes(vault, embed):
