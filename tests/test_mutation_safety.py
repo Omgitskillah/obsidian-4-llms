@@ -1,5 +1,6 @@
 """Deterministic failure and conflict regressions; never use a real vault."""
 import concurrent.futures
+import os
 import subprocess
 import sys
 
@@ -55,6 +56,7 @@ def test_update_rechecks_revision_immediately_before_commit(vault, monkeypatch):
     assert path.read_bytes() == b"newer user data"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows file modes have no group or other bits")
 def test_append_is_atomic_and_preserves_permissions(vault):
     path = vault / "nuru/plan.md"
     path.chmod(0o640)
@@ -110,6 +112,77 @@ def test_directory_symlink_swap_after_resolution_cannot_escape(vault, tmp_path, 
     assert (outside / "new.md").read_text() == "preserve"
 
 
+def _link_directory(link, target):
+    """A directory symlink, or on Windows a junction (which needs no privilege)."""
+    if sys.platform == "win32":
+        import _winapi
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
+def test_a_junction_or_directory_link_in_the_path_is_refused(vault, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (vault / "nuru").rename(vault / "old-nuru")
+    _link_directory(vault / "nuru", outside)
+    with pytest.raises(OSError):
+        mutations.create(vault, vault / "nuru/new.md", b"escaped")
+    with pytest.raises(OSError):
+        mutations.read(vault, vault / "nuru/new.md")
+    assert not list(outside.iterdir())
+
+
+def test_a_directory_swapped_mid_write_cannot_redirect_it(vault, tmp_path, monkeypatch):
+    """Between the path's check and the write, the note's folder is renamed away and a link to outside
+    put in its place. Windows refuses the rename (the folder is held open); POSIX allows it, but the
+    write follows the pinned descriptor into the renamed folder."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    real_stage, refused = mutations._stage, []
+    def swap(fd, data, mode):
+        try:
+            (vault / "nuru").rename(vault / "old-nuru")
+        except PermissionError:
+            refused.append(True)
+        else:
+            _link_directory(vault / "nuru", outside)
+        return real_stage(fd, data, mode)
+    monkeypatch.setattr(mutations, "_stage", swap)
+    mutations.create(vault, vault / "nuru/new.md", b"inside")
+    assert not list(outside.iterdir())
+    if sys.platform == "win32":
+        assert refused and (vault / "nuru/new.md").read_bytes() == b"inside"
+    else:
+        assert (vault / "old-nuru/new.md").read_bytes() == b"inside"
+
+
+def test_a_folder_above_the_vault_swapped_mid_write_cannot_redirect_it(tmp_path, monkeypatch):
+    """The vault's parent folder (Documents\\Vaults for ...\\Vaults\\MyVault) is renamed away mid-write and a
+    link put in its place, leading to a look-alike vault. Windows refuses the rename while the vault is
+    held open; POSIX allows it, but every step goes through the vault's pinned descriptor."""
+    root = tmp_path / "Vaults" / "MyVault"
+    (root / "nuru").mkdir(parents=True)
+    decoy = tmp_path / "decoy"
+    (decoy / "MyVault" / "nuru").mkdir(parents=True)
+    real_stage, refused = mutations._stage, []
+    def swap(fd, data, mode):
+        try:
+            (tmp_path / "Vaults").rename(tmp_path / "Vaults-old")
+        except PermissionError:
+            refused.append(True)
+        else:
+            _link_directory(tmp_path / "Vaults", decoy)
+        return real_stage(fd, data, mode)
+    monkeypatch.setattr(mutations, "_stage", swap)
+    mutations.create(root, root / "nuru/new.md", b"inside")
+    assert not list((decoy / "MyVault" / "nuru").iterdir())
+    if sys.platform == "win32":
+        assert refused and (root / "nuru/new.md").read_bytes() == b"inside"
+    else:
+        assert (tmp_path / "Vaults-old" / "MyVault" / "nuru/new.md").read_bytes() == b"inside"
+
+
 def test_read_only_rejects_every_mutation_but_allows_reading(vault, monkeypatch):
     monkeypatch.setenv("OBSIDIAN_READ_ONLY", "1")
     for call in (
@@ -132,11 +205,16 @@ def test_parallel_appends_are_serialized_without_lost_updates(vault):
 
 
 def test_lock_is_held_across_processes_and_released(vault):
-    code = '''import fcntl, os, sys
+    code = '''import os, sys
 fd = os.open(sys.argv[1], os.O_RDWR)
 try:
-    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-except BlockingIOError:
+    if os.name == "nt":
+        import msvcrt
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
     sys.exit(7)
 '''
     def acquire():
@@ -159,7 +237,7 @@ def test_staging_failure_does_not_publish_partial_create(vault, monkeypatch):
 def test_failed_move_finalization_restores_index_and_files(vault, monkeypatch):
     real_unlink = mutations.os.unlink
     def fail_source(name, **kwargs):
-        if name == "plan.md":
+        if os.path.basename(name) == "plan.md":
             raise PermissionError("injected source unlink failure")
         return real_unlink(name, **kwargs)
     monkeypatch.setattr(mutations.os, "unlink", fail_source)
