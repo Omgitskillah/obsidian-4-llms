@@ -85,7 +85,7 @@ _NOTE_INDEX_NAME = ".obsidian-mcp-index.sqlite3"
 
 _EMBED_TIMEOUT_SECONDS = 120.0
 
-_FRONTMATTER = re.compile(r"\A---\n(?:.*?\n)?---\n", re.DOTALL)
+_FRONTMATTER = re.compile(r"\A---\r?\n((?:.*?\r?\n)?)---\r?\n", re.DOTALL)  # LF or CRLF (an imported or git-converted note)
 _HEADING = re.compile(r"^#{1,6}[ \t]+(.+?)[ \t#]*$")
 _CODE_FENCE = re.compile(r"^ {0,3}(```|~~~)")
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
@@ -433,7 +433,7 @@ def _frontmatter_id(text: str) -> str | None:
     if not match:
         return None
     try:
-        data: Any = yaml.safe_load(match.group(0)[4:-4])
+        data: Any = yaml.safe_load(match.group(1))
     except (yaml.YAMLError, ValueError):
         return None
     note_id = data.get("id") if isinstance(data, dict) else None

@@ -112,6 +112,51 @@ def test_directory_symlink_swap_after_resolution_cannot_escape(vault, tmp_path, 
     assert (outside / "new.md").read_text() == "preserve"
 
 
+def _link_directory(link, target):
+    """A directory symlink, or on Windows a junction (which needs no privilege)."""
+    if sys.platform == "win32":
+        import _winapi
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
+def test_a_junction_or_directory_link_in_the_path_is_refused(vault, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (vault / "nuru").rename(vault / "old-nuru")
+    _link_directory(vault / "nuru", outside)
+    with pytest.raises(OSError):
+        mutations.create(vault, vault / "nuru/new.md", b"escaped")
+    with pytest.raises(OSError):
+        mutations.read(vault, vault / "nuru/new.md")
+    assert not list(outside.iterdir())
+
+
+def test_a_directory_swapped_mid_write_cannot_redirect_it(vault, tmp_path, monkeypatch):
+    """Between the path's check and the write, the note's folder is renamed away and a link to outside
+    put in its place. Windows refuses the rename (the folder is held open); POSIX allows it, but the
+    write follows the pinned descriptor into the renamed folder."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    real_stage, refused = mutations._stage, []
+    def swap(fd, data, mode):
+        try:
+            (vault / "nuru").rename(vault / "old-nuru")
+        except PermissionError:
+            refused.append(True)
+        else:
+            _link_directory(vault / "nuru", outside)
+        return real_stage(fd, data, mode)
+    monkeypatch.setattr(mutations, "_stage", swap)
+    mutations.create(vault, vault / "nuru/new.md", b"inside")
+    assert not list(outside.iterdir())
+    if sys.platform == "win32":
+        assert refused and (vault / "nuru/new.md").read_bytes() == b"inside"
+    else:
+        assert (vault / "old-nuru/new.md").read_bytes() == b"inside"
+
+
 def test_read_only_rejects_every_mutation_but_allows_reading(vault, monkeypatch):
     monkeypatch.setenv("OBSIDIAN_READ_ONLY", "1")
     for call in (

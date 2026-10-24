@@ -1,10 +1,10 @@
 """Vault mutations. Cooperating writers lock; external editors do not.
 
 On POSIX every step goes through pinned directory descriptors, so a symlink swapped in after a check
-can't redirect it. Windows has no directory descriptors: there each directory on the way is checked
-for a symlink or junction just before use, and a file is checked once open, when Windows no longer
-lets it be renamed or deleted. A directory swapped between its check and its use can still redirect a
-step there, which takes a process already running as this user.
+can't redirect it. Windows has no directory descriptors: there the root and each directory on the way
+are held open, refusing a symlink or junction, without letting anyone rename or delete them, for the
+whole operation, so the path through them leads where it was checked; a file is checked once open,
+when Windows no longer lets it be renamed or deleted either.
 """
 import contextlib
 import errno
@@ -18,7 +18,20 @@ from typing import Iterator
 
 _WINDOWS = os.name == "nt"
 if _WINDOWS:
+    import ctypes
     import msvcrt
+    from ctypes import wintypes
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                      wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    _kernel32.CreateFileW.restype = wintypes.HANDLE
+    _kernel32.GetFileInformationByHandleEx.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+    _kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    class _AttributeTagInfo(ctypes.Structure):
+        _fields_ = [("FileAttributes", wintypes.DWORD), ("ReparseTag", wintypes.DWORD)]
 else:
     import fcntl
 
@@ -83,15 +96,42 @@ def coordinate(root: Path) -> Iterator[None]:
             os.close(fd)
 
 
-def _check(path: str, *, directory: bool) -> os.stat_result:
-    """Windows: what lstat says of path, refusing a symlink or junction (not other reparse points,
-    such as OneDrive's placeholders)."""
+# A reparse point that names another place (symlink, junction...); others, such as OneDrive's
+# placeholders, are the file itself.
+_NAME_SURROGATE = 0x20000000
+
+
+def _check(path: str) -> os.stat_result:
+    """Windows: what lstat says of a file, refusing a symlink or junction."""
     info = os.lstat(path)
-    if stat.S_ISLNK(info.st_mode) or info.st_reparse_tag == stat.IO_REPARSE_TAG_MOUNT_POINT:
+    if stat.S_ISLNK(info.st_mode) or info.st_reparse_tag & _NAME_SURROGATE:
         raise OSError(errno.ELOOP, "Refusing a symlink or junction", path)
-    if directory and not stat.S_ISDIR(info.st_mode):
-        raise NotADirectoryError(errno.ENOTDIR, "Not a directory", path)
     return info
+
+
+def _pin(path: str) -> int:
+    """Windows: a handle on the directory at path (not where a symlink or junction there leads), which
+    stops it being renamed or deleted until closed. It asks to list the directory: Windows doesn't
+    apply sharing to a handle that only reads attributes, and so wouldn't stop a rename."""
+    list_directory, read_attributes = 0x1, 0x80
+    share_read_write = 0x1 | 0x2  # not FILE_SHARE_DELETE
+    open_existing, backup_semantics, open_reparse_point = 3, 0x02000000, 0x00200000
+    handle = _kernel32.CreateFileW(path, list_directory | read_attributes, share_read_write, None, open_existing,
+                                   backup_semantics | open_reparse_point, None)
+    if handle in (None, wintypes.HANDLE(-1).value):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        info = _AttributeTagInfo()
+        if not _kernel32.GetFileInformationByHandleEx(handle, 9, ctypes.byref(info), ctypes.sizeof(info)):  # FileAttributeTagInfo
+            raise ctypes.WinError(ctypes.get_last_error())
+        if info.FileAttributes & stat.FILE_ATTRIBUTE_REPARSE_POINT and info.ReparseTag & _NAME_SURROGATE:
+            raise OSError(errno.ELOOP, "Refusing a symlink or junction", path)
+        if not info.FileAttributes & stat.FILE_ATTRIBUTE_DIRECTORY:
+            raise NotADirectoryError(errno.ENOTDIR, "Not a directory", path)
+    except BaseException:
+        _kernel32.CloseHandle(handle)
+        raise
+    return handle
 
 
 @contextlib.contextmanager
@@ -103,16 +143,20 @@ def parent(root: Path, path: Path, *, create: bool = False) -> Iterator[tuple[in
         raise ValueError("Invalid mutation path")
     if _WINDOWS:
         directory = str(root)
-        _check(directory, directory=True)
-        for component in relative.parts[:-1]:
-            directory = os.path.join(directory, component)
-            if create:
-                try:
-                    os.mkdir(directory)
-                except FileExistsError:
-                    pass
-            _check(directory, directory=True)
-        yield directory, relative.name
+        pinned = [_pin(directory)]
+        try:
+            for component in relative.parts[:-1]:
+                directory = os.path.join(directory, component)
+                if create:
+                    try:
+                        os.mkdir(directory)
+                    except FileExistsError:
+                        pass
+                pinned.append(_pin(directory))
+            yield directory, relative.name
+        finally:
+            for handle in reversed(pinned):
+                _kernel32.CloseHandle(handle)
         return
     fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
@@ -138,7 +182,7 @@ def _open(directory: int | str, name: str, flags: int, mode: int = 0o777) -> int
     fd = os.open(path, flags | _BINARY, mode)
     try:
         # Open, the file can't be renamed or deleted, so the name still leads to it.
-        opened, named = os.fstat(fd), _check(path, directory=False)
+        opened, named = os.fstat(fd), _check(path)
         if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
             raise OSError(errno.ELOOP, "Refusing a symlink or junction", path)
     except BaseException:

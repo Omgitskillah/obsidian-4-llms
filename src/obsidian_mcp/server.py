@@ -84,7 +84,7 @@ _FIND_LINES_PER_NOTE = 5
 # still finds only that adjacent pair, not every note mentioning 09 and 17
 # separately - which is how dates get searched.
 _WORD_JOINERS = re.compile(r"[-_]+")
-_FRONTMATTER = re.compile(r"\A---\n(?:.*?\n)?---\n", re.DOTALL)
+_FRONTMATTER = re.compile(r"\A---\r?\n((?:.*?\r?\n)?)---\r?\n", re.DOTALL)  # LF or CRLF (an imported or git-converted note)
 
 _DATE_PATTERN = re.compile(r"^(\d{4}-\d{2}-\d{2})$")
 _SESSION_PATTERN = re.compile(r"^(\d{4}-\d{2}-\d{2})-(\d{2})$")
@@ -419,7 +419,7 @@ def _read_frontmatter(text: str) -> dict[str, Any]:
     if not match:
         return {}
     try:
-        data: Any = yaml.safe_load(match.group(0)[4:-4])  # between the two "---\n" fences
+        data: Any = yaml.safe_load(match.group(1))  # between the two fences
     except (yaml.YAMLError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}

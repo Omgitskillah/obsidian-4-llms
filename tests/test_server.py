@@ -2306,6 +2306,27 @@ def test_replace_rewrites_the_body_and_keeps_the_frontmatter(tmp_path, monkeypat
     assert server.read_note(made["id"]).endswith("new line")
 
 
+def test_a_crlf_note_keeps_its_frontmatter_through_a_replace(tmp_path, monkeypatch):
+    """An imported or git-converted note has \\r\\n line ends; written as raw bytes, so no test default
+    turns them into \\n."""
+    from obsidian_mcp import semantic
+
+    monkeypatch.setattr(server, "VAULT_PATH", tmp_path)
+    made = server.create_note(type="topic", title="Plan", author="nuru", body="old line")
+    path = tmp_path / made["path"]
+    crlf = path.read_bytes().replace(b"\n", b"\r\n")
+    path.write_bytes(crlf)
+    text = crlf.decode("utf-8")
+    assert server._read_frontmatter(text)["id"] == made["id"]
+    assert semantic._frontmatter_id(text) == made["id"]
+
+    server.write_note("new line", note="Plan", mode="replace", expected_revision=server.read_note_snapshot("Plan")["revision"])
+
+    frontmatter = crlf[: crlf.index(b"---\r\n", 5) + 5]
+    assert path.read_bytes() == frontmatter + b"\nnew line"
+    assert server.read_note(made["id"]).endswith("new line")
+
+
 def test_replace_with_nothing_is_refused(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "VAULT_PATH", tmp_path)
     server.create_note(type="topic", title="Plan", author="nuru", body="keep me")
