@@ -142,7 +142,7 @@ def main():
     parser.add_argument('--evidence-revision')
     parser.add_argument('--review-status', choices=['acknowledged', 'suppressed', 'open'])
     args = parser.parse_args()
-    steward = Steward(args.vault, json.loads(args.config.read_text()), state_path=args.state)
+    steward = Steward(args.vault, json.loads(args.config.read_text(encoding="utf-8")), state_path=args.state)
     report = steward.run_once(limit=args.limit, offset=args.offset, include_details=args.details)
     if any([args.review_id, args.evidence_revision, args.review_status]):
         if not all([args.state, args.review_id, args.evidence_revision, args.review_status]):

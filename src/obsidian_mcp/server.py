@@ -315,7 +315,7 @@ def _is_within_vault(path: Path) -> bool:
 
 
 def _rel(path: Path) -> str:
-    return str(path.relative_to(VAULT_PATH))
+    return path.relative_to(VAULT_PATH).as_posix()
 
 
 def _is_archived(path: Path) -> bool:
@@ -379,7 +379,7 @@ def _folder_listing(directory: str) -> dict[str, Any]:
     _check_accessible(target)
 
     files = sorted(
-        str(path.relative_to(VAULT_PATH))
+        path.relative_to(VAULT_PATH).as_posix()
         for path in target.rglob("*")
         if path.is_file() and _is_visible(path) and not _is_trashed(path) and _is_within_vault(path)
     )
@@ -464,7 +464,7 @@ def _note_row(path: Path, indexed: dict[str, dict[str, str]], text: str | None =
     info = indexed.get(rel)
     if info:
         return {"path": rel, "id": info["id"], "type": info["type"], "title": info["title"]}
-    note_type = _read_frontmatter(path.read_text(errors="ignore") if text is None else text).get("type")
+    note_type = _read_frontmatter(path.read_text(encoding="utf-8", errors="ignore") if text is None else text).get("type")
     return {"path": rel, "id": None, "type": note_type if isinstance(note_type, str) else None, "title": path.stem}
 
 
@@ -496,7 +496,7 @@ def _newest_key(path: Path, indexed: dict[str, dict[str, str]]) -> tuple[str, st
 
 def _sort_field(path: Path, field: str) -> str:
     """A note's own `date` or `session` frontmatter as a string, "" if it has none."""
-    return _date_str(_read_frontmatter(path.read_text(errors="ignore")).get(field)) or ""
+    return _date_str(_read_frontmatter(path.read_text(encoding="utf-8", errors="ignore")).get(field)) or ""
 
 
 def _snippet(text: str, patterns: list[re.Pattern[str]]) -> str:
@@ -553,11 +553,11 @@ def search_notes(query: str) -> dict[str, Any]:
 
     hits: list[tuple[int, dict[str, Any]]] = []
     for path in _all_notes():
-        rel_path = str(path.relative_to(VAULT_PATH))
+        rel_path = path.relative_to(VAULT_PATH).as_posix()
         info: dict[str, str] = indexed.get(rel_path, {})
         title = info.get("title", path.stem)
         name = f"{path.stem} {title}"
-        text = path.read_text(errors="ignore")
+        text = path.read_text(encoding="utf-8", errors="ignore")
         if not all(p.search(name) or p.search(text) for p in patterns):
             continue
         rank = sum(1 for p in patterns if p.search(name))
@@ -910,7 +910,7 @@ def all_tags() -> dict[str, Any]:
     _check_accessible(VAULT_PATH)
     counts: Counter[str] = Counter()
     for path in _all_notes():
-        counts.update(_note_tags(path.read_text(errors="ignore")))
+        counts.update(_note_tags(path.read_text(encoding="utf-8", errors="ignore")))
 
     most_used = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
     result: dict[str, Any] = {"count": len(counts), "tags": dict(most_used[:_LIST_LIMIT])}
@@ -949,7 +949,7 @@ def notes_with_tag(tag: str) -> dict[str, Any]:
     in_use: set[str] = set()
     hits: list[tuple[tuple[str, str, str], Path, str]] = []
     for path in _all_notes():
-        text = path.read_text(errors="ignore")
+        text = path.read_text(encoding="utf-8", errors="ignore")
         tags = _note_tags(text)
         in_use |= tags
         if any(t == wanted or t.startswith(f"{wanted}/") for t in tags):
@@ -980,7 +980,7 @@ def list_tags() -> list[str]:
     _check_accessible(VAULT_PATH)
     tags: set[str] = set()
     for path in _all_notes():
-        tags.update(TAG_PATTERN.findall(path.read_text(errors="ignore")))
+        tags.update(TAG_PATTERN.findall(path.read_text(encoding="utf-8", errors="ignore")))
     return sorted(tags)
 
 
@@ -993,7 +993,7 @@ def count_tags() -> dict[str, int]:
     _check_accessible(VAULT_PATH)
     counts: Counter[str] = Counter()
     for path in _all_notes():
-        counts.update(TAG_PATTERN.findall(path.read_text(errors="ignore")))
+        counts.update(TAG_PATTERN.findall(path.read_text(encoding="utf-8", errors="ignore")))
     return dict(sorted(counts.items()))
 
 
@@ -1022,7 +1022,7 @@ class _NoteNames:
         for path in self.notes:
             rel = _rel(path)
             info = indexed.get(rel, {})
-            frontmatter = _read_frontmatter(path.read_text(errors="ignore"))
+            frontmatter = _read_frontmatter(path.read_text(encoding="utf-8", errors="ignore"))
             aliases = frontmatter.get("aliases")
             self._add(self._by_path, rel.removesuffix(".md"), path)
             self._add(self._by_stem, path.stem, path)
@@ -1279,7 +1279,7 @@ def get_links(name: str) -> dict[str, Any]:
     names = _NoteNames()
 
     outgoing: list[dict[str, str | None]] = []
-    for link in _link_targets(target.read_text(errors="ignore")):
+    for link in _link_targets(target.read_text(encoding="utf-8", errors="ignore")):
         found = names.resolve(link)
         outgoing.append({"link": link, "path": _rel(found[0]) if found else None})
 
@@ -1288,7 +1288,7 @@ def get_links(name: str) -> dict[str, Any]:
         rel = _rel(path)
         if rel == target_rel:
             continue
-        for link in _link_targets(path.read_text(errors="ignore")):
+        for link in _link_targets(path.read_text(encoding="utf-8", errors="ignore")):
             found = names.resolve(link)
             if found and _rel(found[0]) == target_rel:
                 backlinks.append(rel)
@@ -1338,7 +1338,7 @@ def find_broken_links() -> dict[str, Any]:
     broken: list[dict[str, Any]] = []
     for path in names.notes:
         seen: set[str] = set()
-        for number, line in enumerate(path.read_text(errors="ignore").splitlines(), start=1):
+        for number, line in enumerate(path.read_text(encoding="utf-8", errors="ignore").splitlines(), start=1):
             for link in _link_targets(line):
                 if link in seen or names.resolve(link) or Path(link).name.lower() in files:
                     continue
@@ -1390,7 +1390,7 @@ def audit_stewardship(limit: int = 50, offset: int = 0) -> dict[str, Any]:
     path = os.environ.get('OBSIDIAN_STEWARD_CONFIG')
     if not path:
         return {'state': 'not_configured', 'hint': 'Set OBSIDIAN_STEWARD_CONFIG to an explicit JSON configuration file.'}
-    config = json.loads(Path(path).expanduser().read_text())
+    config = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
     identity = (str(VAULT_PATH.resolve()), json.dumps(config, sort_keys=True))
     with _STEWARD_LOCK:
         if _STEWARD is None or _STEWARD_CONFIG != identity:
@@ -1412,7 +1412,7 @@ def note_tags(name: str) -> dict[str, Any]:
     #tags, lowercased and without the '#'. Returns {"note", "tags"}, tags sorted."""
     _check_accessible(VAULT_PATH)
     target = _resolve_note(name)
-    return {"note": _rel(target), "tags": sorted(_note_tags(target.read_text(errors="ignore")))}
+    return {"note": _rel(target), "tags": sorted(_note_tags(target.read_text(encoding="utf-8", errors="ignore")))}
 
 
 @_tool
@@ -1427,7 +1427,7 @@ def note_todos(name: str) -> dict[str, Any]:
     """
     _check_accessible(VAULT_PATH)
     target = _resolve_note(name)
-    text = target.read_text(errors="ignore")
+    text = target.read_text(encoding="utf-8", errors="ignore")
     frontmatter = _FRONTMATTER.match(text)
     lines = text.splitlines()
     todos: list[dict[str, Any]] = []
@@ -1526,8 +1526,8 @@ def _reject_user_authored(target: Path, rel_path: str) -> None:
         return
     notes = [target] if target.is_file() else sorted(target.rglob("*.md")) if target.is_dir() else []
     for note in notes:
-        if note.suffix == ".md" and _read_frontmatter(note.read_text(errors="ignore")).get("author") == "user":
-            shown = rel_path if note == target else str(note.relative_to(VAULT_PATH))
+        if note.suffix == ".md" and _read_frontmatter(note.read_text(encoding="utf-8", errors="ignore")).get("author") == "user":
+            shown = rel_path if note == target else note.relative_to(VAULT_PATH).as_posix()
             raise PermissionError(
                 f"'{shown}' was written by the user (author: user), so Nuru may not change, move or delete it. "
                 "Tell the user it can't be changed. Don't make a copy or a new note in its place; only if they "
@@ -1587,7 +1587,7 @@ def _frontmatters_mentioning(needle: str) -> Iterator[tuple[Path, dict[str, Any]
     """(path, frontmatter) of every note whose text contains `needle`. The
     substring test comes first, so only the few likely matches pay for a YAML parse."""
     for path in _all_notes():
-        text = path.read_text(errors="ignore")
+        text = path.read_text(encoding="utf-8", errors="ignore")
         if needle in text:
             yield path, _read_frontmatter(text)
 
@@ -1895,7 +1895,7 @@ def _correction_targets(content: str) -> list[str]:
         if not found:
             continue
         path = found[0]
-        note_id = indexed.get(_rel(path), {}).get("id") or _read_frontmatter(path.read_text(errors="ignore")).get("id")
+        note_id = indexed.get(_rel(path), {}).get("id") or _read_frontmatter(path.read_text(encoding="utf-8", errors="ignore")).get("id")
         target = str(note_id) if note_id else path.stem
         if target not in targets:
             targets.append(target)
@@ -2187,8 +2187,8 @@ def rename_or_move_file(source_path: str, destination_path: str) -> dict[str, st
     if destination.exists():
         raise FileExistsError(f"A file already exists at '{destination_path}'.")
 
-    source_rel = str(source.relative_to(VAULT_PATH))
-    destination_rel = str(destination.relative_to(VAULT_PATH))
+    source_rel = source.relative_to(VAULT_PATH).as_posix()
+    destination_rel = destination.relative_to(VAULT_PATH).as_posix()
 
     def _move() -> None:
         # Opened (and reconciled) before the physical move: _open_index()

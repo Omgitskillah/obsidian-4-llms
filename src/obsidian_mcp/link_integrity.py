@@ -103,7 +103,7 @@ class Policy:
     def load(cls, path: Path | None) -> Policy:
         if path is None:
             return cls()
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict) or set(data) - {"exclusions", "intentional"}:
             raise ValueError("Link policy accepts only exclusions and intentional")
         exclusions = data.get("exclusions", list(DEFAULT_EXCLUSIONS))
@@ -282,7 +282,7 @@ class LinkIndex:
         files, excluded, blocked, notes, diagnostics = set(), set(), set(), {}, []
         parsed = reused = bytes_read = 0
         def error(exc):
-            diagnostics.append({"path": str(Path(exc.filename).relative_to(self.vault)), "reason": "unreadable_directory"})
+            diagnostics.append({"path": Path(exc.filename).relative_to(self.vault).as_posix(), "reason": "unreadable_directory"})
         for folder, dirs, names in os.walk(self.vault, followlinks=False, onerror=error):
             base = Path(folder)
             # Catalog excluded files without reading their contents, so an explicit
