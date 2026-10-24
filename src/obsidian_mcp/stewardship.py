@@ -42,8 +42,7 @@ def digest(data: bytes) -> str:
 def asset_hash(root: Path, path: Path, should_stop: Callable[[], bool] | None = None) -> tuple[str, int]:
     """Hash regular assets in 1 MiB chunks through symlink-safe descriptors."""
     with mutations.parent(root, path) as (fd, name):
-        file_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
-        with os.fdopen(file_fd, 'rb') as file:
+        with os.fdopen(mutations.open_read(fd, name), 'rb') as file:
             before = os.fstat(file.fileno())
             if not stat.S_ISREG(before.st_mode):
                 raise ValueError('not_regular_file')

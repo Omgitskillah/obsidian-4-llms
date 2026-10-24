@@ -1,5 +1,6 @@
 """Deterministic failure and conflict regressions; never use a real vault."""
 import concurrent.futures
+import os
 import subprocess
 import sys
 
@@ -132,11 +133,16 @@ def test_parallel_appends_are_serialized_without_lost_updates(vault):
 
 
 def test_lock_is_held_across_processes_and_released(vault):
-    code = '''import fcntl, os, sys
+    code = '''import os, sys
 fd = os.open(sys.argv[1], os.O_RDWR)
 try:
-    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-except BlockingIOError:
+    if os.name == "nt":
+        import msvcrt
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
     sys.exit(7)
 '''
     def acquire():
@@ -159,7 +165,7 @@ def test_staging_failure_does_not_publish_partial_create(vault, monkeypatch):
 def test_failed_move_finalization_restores_index_and_files(vault, monkeypatch):
     real_unlink = mutations.os.unlink
     def fail_source(name, **kwargs):
-        if name == "plan.md":
+        if os.path.basename(name) == "plan.md":
             raise PermissionError("injected source unlink failure")
         return real_unlink(name, **kwargs)
     monkeypatch.setattr(mutations.os, "unlink", fail_source)

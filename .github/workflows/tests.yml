@@ -6,7 +6,11 @@ on:
 
 jobs:
   tests:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
       - name: Install uv
@@ -15,7 +19,7 @@ jobs:
         run: uv sync --locked
       - name: Run tests
         env:
-          VAULT_PATH: /tmp/ci-vault
+          VAULT_PATH: ${{ runner.temp }}/ci-vault
         run: uv run --locked pytest -v tests vendor/access-logging/tests --cov=obsidian_mcp --cov=access_logging --cov-report=term-missing
       - name: Coverage summary
         if: always()
