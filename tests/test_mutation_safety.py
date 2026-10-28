@@ -332,3 +332,68 @@ def test_move_recovery_refusal_is_not_a_prewrite_rejection(vault, monkeypatch):
         server.rename_or_move_file('nuru/plan.md', 'nuru/moved.md')
     assert 'REJECTED_BEFORE_WRITE' not in str(caught.value)
     assert destination.exists() and (vault / 'nuru/plan.md').exists()
+
+
+# ---------------------------------------------------------------- F13: refusals at the edges of a mutation
+posix = pytest.mark.skipif(sys.platform == "win32", reason="FIFOs are POSIX")
+
+
+@posix
+def test_a_lock_file_that_is_not_a_regular_file_refuses_every_mutation(vault):
+    (vault / ".obsidian-mcp-write.lock").unlink()
+    os.mkfifo(vault / ".obsidian-mcp-write.lock")
+    with pytest.raises(ToolError, match="Mutation lock is not a regular file"):
+        server.write_note("more", note="Plan")
+    assert (vault / "nuru" / "plan.md").read_text().endswith("original")
+
+
+@posix
+def test_a_note_that_is_not_a_regular_file_is_never_read_or_replaced(vault):
+    os.mkfifo(vault / "nuru" / "pipe.md")
+    with pytest.raises(ValueError, match="Mutation target is not a regular file"):
+        mutations.read(vault, vault / "nuru" / "pipe.md")
+    with mutations.coordinate(vault), pytest.raises(ValueError, match="not a regular file"):
+        mutations.update(vault, vault / "nuru" / "pipe.md", b"", b"new")
+
+
+@pytest.mark.parametrize("relative", ["", "nuru/../nuru/plan.md"])
+def test_the_vault_itself_or_a_path_through_dotdot_is_not_a_mutation_target(vault, relative):
+    with pytest.raises(ValueError, match="Invalid mutation path"):
+        mutations.read(vault, vault / relative if relative else vault)
+
+
+def test_an_update_from_a_stale_copy_is_refused_before_anything_is_staged(vault):
+    path = vault / "nuru" / "plan.md"
+    before = path.read_bytes()
+    with mutations.coordinate(vault), pytest.raises(ValueError, match="Revision conflict: reread the note"):
+        mutations.update(vault, path, b"what the caller last saw", b"new")
+    assert path.read_bytes() == before
+    assert not list(path.parent.glob(".obsidian-mcp-*.tmp"))
+
+
+def test_a_source_changed_while_a_move_is_finishing_keeps_it_and_removes_only_our_copy(vault):
+    source, destination = vault / "nuru" / "plan.md", vault / "nuru" / "moved.md"
+    with mutations.coordinate(vault), pytest.raises(ValueError, match="Revision conflict during move"):
+        with mutations.move(vault, source, destination):
+            # Another editor saves the source (a new file, as editors write) before the move finishes.
+            changed = source.with_name("plan.md.editor")
+            changed.write_bytes(b"edited elsewhere")
+            os.replace(changed, source)
+    assert source.read_bytes() == b"edited elsewhere" and not destination.exists()
+
+
+def test_a_destination_that_differs_right_after_linking_is_never_kept(vault, monkeypatch):
+    source, destination = vault / "nuru" / "plan.md", vault / "nuru" / "moved.md"
+    before = source.read_bytes()
+    real_read, reads = mutations._read, []
+    def read(fd, name):
+        data, mode = real_read(fd, name)
+        reads.append(name)
+        if name == "moved.md" and len(reads) == 2:  # the check straight after the link
+            return b"not what was linked", mode
+        return data, mode
+    monkeypatch.setattr(mutations, "_read", read)
+    with mutations.coordinate(vault), pytest.raises(ValueError, match="Revision conflict during move"):
+        with mutations.move(vault, source, destination):
+            pytest.fail("the move went on after a mismatched link")
+    assert source.read_bytes() == before and not destination.exists()
