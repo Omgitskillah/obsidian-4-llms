@@ -314,6 +314,18 @@ def _is_within_vault(path: Path) -> bool:
         return False
 
 
+def _is_readable(path: Path) -> bool:
+    """A vault path whose note the tools may read: outside hidden folders and trash/, both where it
+    is named and, for a symlink, where it leads - which must be inside the vault."""
+    if not _is_visible(path) or _is_trashed(path):
+        return False
+    try:
+        real = path.resolve()
+    except OSError:
+        return False
+    return real.is_relative_to(VAULT_PATH) and _is_visible(real) and not _is_trashed(real)
+
+
 def _rel(path: Path) -> str:
     return path.relative_to(VAULT_PATH).as_posix()
 
@@ -338,7 +350,7 @@ def _all_notes() -> list[Path]:
     return sorted(
         p
         for p in VAULT_PATH.rglob("*.md")
-        if _is_visible(p) and not _is_in_templates(p) and not _is_trashed(p) and _is_within_vault(p)
+        if not _is_in_templates(p) and _is_readable(p)
     )
 
 
@@ -1081,17 +1093,15 @@ def _matching_notes(name: str) -> list[Path]:
     Failing both, forgiving (see _NoteNames): case, slug, title, alias and id.
     More than one is only returned when a name genuinely matches several -
     the same filename in two folders, two notes sharing an alias. Nothing in
-    trash/ ever matches. The forgiving step reads every note, so it only runs
+    trash/ or a hidden folder (.trash, .obsidian) ever matches, even by exact path. The forgiving step reads every note, so it only runs
     when the exact ones find nothing.
     """
     filename = name if name.endswith(".md") else f"{name}.md"
 
     target = (VAULT_PATH / filename).resolve()
-    if target.is_relative_to(VAULT_PATH) and target.is_file() and not _is_trashed(target):
+    if target.is_relative_to(VAULT_PATH) and target.is_file() and _is_readable(target):
         return [target]
-    exact = sorted(
-        p for p in VAULT_PATH.rglob("*.md") if p.name == filename and not _is_trashed(p) and _is_within_vault(p)
-    )
+    exact = sorted(p for p in VAULT_PATH.rglob("*.md") if p.name == filename and _is_readable(p))
     if exact:
         return exact
     return _NoteNames().resolve(name)

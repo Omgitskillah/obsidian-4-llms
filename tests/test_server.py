@@ -1831,6 +1831,40 @@ def test_read_note_forgiving_match_skips_hidden_folders(tmp_path, monkeypatch):
         server.read_note("deleted note")
 
 
+@pytest.mark.parametrize("hidden", [".trash/removed.md", ".obsidian/plugin notes.md", ".app/cache/kept.md"])
+@pytest.mark.parametrize("by", ["path", "path without .md", "filename"])
+def test_hidden_and_deleted_notes_cannot_be_read_by_exact_name(tmp_path, monkeypatch, hidden, by):
+    """F02: browse and search skip hidden folders, so an exact name mustn't reach them either."""
+    _vault_with(tmp_path, monkeypatch, {hidden: "HIDDEN MARKER", "Visible.md": "seen"})
+    name = {"path": hidden, "path without .md": hidden[:-3], "filename": hidden.rsplit("/", 1)[-1]}[by]
+
+    for read in (lambda: server.read_note(name), lambda: server.read_note(name, include_revision=True),
+                 lambda: server.note_info(name)):
+        with pytest.raises(ToolError, match="FileNotFoundError") as refused:
+            read()
+        # The same refusal as for a note that isn't there: nothing says the hidden one exists.
+        assert str(refused.value).endswith(f"No note found named '{name}'. Use browse or search to find the right note.")
+    assert server.read_note("Visible") == "seen"
+
+
+def test_a_visible_symlink_into_a_hidden_folder_is_not_read(tmp_path, monkeypatch):
+    _vault_with(tmp_path, monkeypatch, {".trash/removed.md": "HIDDEN MARKER"})
+    (tmp_path / "Alias.md").symlink_to(tmp_path / ".trash" / "removed.md")
+    (tmp_path / "Shortcut").symlink_to(tmp_path / ".trash", target_is_directory=True)
+
+    for name in ("Alias", "Alias.md", "Shortcut/removed", "removed"):
+        with pytest.raises(ToolError, match="FileNotFoundError"):
+            server.read_note(name)
+    assert "Alias.md" not in str(server.browse())
+
+
+def test_a_template_can_still_be_read_by_its_exact_path(tmp_path, monkeypatch):
+    _vault_with(tmp_path, monkeypatch, {"Templates/Daily.md": "# {{date}}"})
+
+    assert server.read_note("Templates/Daily") == "# {{date}}"
+    assert server.read_note("Daily") == "# {{date}}"
+
+
 def test_read_note_forgiving_match_does_not_reach_a_symlink_pointing_outside_the_vault(tmp_path, monkeypatch):
     vault = tmp_path / "vault"
     vault.mkdir()
