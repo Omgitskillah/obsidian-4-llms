@@ -6,6 +6,7 @@ import sqlite3
 import subprocess
 import sys
 from datetime import datetime
+from pathlib import Path
 
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
@@ -1449,6 +1450,33 @@ def test_browse_mentions_only_the_folders_that_hold_notes(tmp_path, monkeypatch)
 
     assert result["not_listed"] == "1 note in Templates/ (note skeletons) isn't listed or counted."
     assert result["hint"] == "The vault has no notes yet."
+
+
+def test_browse_does_not_count_a_symlink_leading_somewhere_hidden_or_out_of_the_vault(tmp_path, monkeypatch):
+    vault = tmp_path / "vault"
+    _vault_with(vault, monkeypatch, {"Templates/Daily.md": "x", "trash/gone.md": "x", "kept.md": "x",
+                                     ".hidden/Secret.md": "x"})
+    (tmp_path / "outside.md").write_text("x")
+    (vault / "Templates" / "ToHidden.md").symlink_to(vault / ".hidden" / "Secret.md")
+    (vault / "Templates" / "Outside.md").symlink_to(tmp_path / "outside.md")
+    (vault / "trash" / "ToHidden.md").symlink_to(vault / ".hidden" / "Secret.md")
+    (vault / "Templates" / "ToKept.md").symlink_to(vault / "kept.md")  # leads somewhere visible: counted
+
+    assert server.browse()["not_listed"] == ("2 notes in Templates/ (note skeletons) and 1 note in trash/ "
+                                             "(deleted notes) aren't listed or counted.")
+
+
+def test_browse_does_not_count_a_note_whose_target_cannot_be_resolved(tmp_path, monkeypatch):
+    _vault_with(tmp_path, monkeypatch, {"Templates/Daily.md": "x", "Templates/Odd.md": "x"})
+    real_resolve = Path.resolve
+
+    def failing(self, strict=False):
+        if self.name == "Odd.md":
+            raise OSError("permission denied on a parent")
+        return real_resolve(self, strict)
+
+    monkeypatch.setattr(Path, "resolve", failing)
+    assert server.browse()["not_listed"] == "1 note in Templates/ (note skeletons) isn't listed or counted."
 
 
 def test_browse_says_nothing_about_skipped_folders_when_there_are_none_or_it_is_narrowed(tmp_path, monkeypatch):

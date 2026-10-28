@@ -296,12 +296,22 @@ def browse(type: str | None = None, limit: int = 10, folder: str | None = None) 
     return result
 
 
+def _leads_somewhere_visible(path: Path) -> bool:
+    """`path`, or a symlink's target, is inside the vault and outside hidden folders. Unlike the read
+    rule, trash/ is allowed: browse counts what it holds."""
+    try:
+        real = path.resolve()
+    except OSError:
+        return False
+    return real.is_relative_to(VAULT_PATH) and _is_visible(real)
+
+
 def _not_listed() -> str:
     """What browse leaves out of a whole-vault listing, e.g. "11 notes in Templates/ (note skeletons)
     aren't listed or counted." - "" when Templates/ and trash/ hold no notes."""
     parts, total = [], 0
     for folder, what in ((_TEMPLATES_FOLDER, "note skeletons"), (_TRASH_FOLDER, "deleted notes")):
-        count = sum(1 for p in (VAULT_PATH / folder).rglob("*.md") if _is_visible(p) and _is_within_vault(p))
+        count = sum(1 for p in (VAULT_PATH / folder).rglob("*.md") if _is_visible(p) and _leads_somewhere_visible(p))
         if count:
             parts.append(f"{count} note{'s' if count > 1 else ''} in {folder}/ ({what})")
             total += count
