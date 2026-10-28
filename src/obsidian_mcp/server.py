@@ -241,7 +241,8 @@ def browse(type: str | None = None, limit: int = 10, folder: str | None = None) 
     was written more recently. A "hint" explains an empty result, or that results
     were cut off - a bare empty list would reach the model as a blank tool
     result it can't interpret.
-    Excludes Templates/ and trash/.
+    Excludes Templates/ and trash/; without type or folder, "not_listed" says how
+    many notes each of them holds, so a count of the vault's files isn't short.
     """
     _check_accessible(VAULT_PATH)
     wanted = (type or "").strip().lower() or None
@@ -290,7 +291,22 @@ def browse(type: str | None = None, limit: int = 10, folder: str | None = None) 
         if wanted is None:
             hint += " Pass type to narrow."
         result["hint"] = hint
+    if wanted is None and listing is None and (skipped := _not_listed()):
+        result["not_listed"] = skipped
     return result
+
+
+def _not_listed() -> str:
+    """What browse leaves out of a whole-vault listing, e.g. "11 notes in Templates/ (note skeletons)
+    aren't listed or counted." - "" when Templates/ and trash/ hold no notes."""
+    parts, total = [], 0
+    for folder, what in ((_TEMPLATES_FOLDER, "note skeletons"), (_TRASH_FOLDER, "deleted notes")):
+        count = sum(1 for p in (VAULT_PATH / folder).rglob("*.md") if _is_visible(p) and _is_within_vault(p))
+        if count:
+            parts.append(f"{count} note{'s' if count > 1 else ''} in {folder}/ ({what})")
+            total += count
+    verb = "isn't" if total == 1 else "aren't"
+    return f"{' and '.join(parts)} {verb} listed or counted." if parts else ""
 
 
 def _is_visible(path: Path) -> bool:
