@@ -1430,6 +1430,64 @@ def test_browse_notes_excludes_templates_trash_and_hidden_folders(tmp_path, monk
     assert _browse_paths(server.browse()) == ["kept.md"]
 
 
+def test_browse_says_how_many_notes_templates_and_trash_hold(tmp_path, monkeypatch):
+    """R22: a model asked how many notes the vault has must not take browse's count as the whole vault."""
+    _vault_with(tmp_path, monkeypatch, {"kept.md": "x", "Templates/Daily.md": "x", "Templates/sub/Person.md": "x",
+                                        "trash/nuru/gone.md": "x", "Templates/.hidden/x.md": "x",
+                                        "Templates/picture.png": "x", ".trash/old.md": "x"})
+
+    result = server.browse()
+
+    assert result["count"] == 1
+    assert result["not_listed"] == ("2 notes in Templates/ (note skeletons) and 1 note in trash/ (deleted notes) "
+                                    "aren't listed or counted.")
+
+
+def test_browse_mentions_only_the_folders_that_hold_notes(tmp_path, monkeypatch):
+    _vault_with(tmp_path, monkeypatch, {"Templates/Daily.md": "x"})
+
+    result = server.browse()
+
+    assert result["not_listed"] == "1 note in Templates/ (note skeletons) isn't listed or counted."
+    assert result["hint"] == "The vault has no notes yet."
+
+
+def test_browse_does_not_count_a_symlink_leading_somewhere_hidden_or_out_of_the_vault(tmp_path, monkeypatch):
+    vault = tmp_path / "vault"
+    _vault_with(vault, monkeypatch, {"Templates/Daily.md": "x", "trash/gone.md": "x", "kept.md": "x",
+                                     ".hidden/Secret.md": "x"})
+    (tmp_path / "outside.md").write_text("x")
+    (vault / "Templates" / "ToHidden.md").symlink_to(vault / ".hidden" / "Secret.md")
+    (vault / "Templates" / "Outside.md").symlink_to(tmp_path / "outside.md")
+    (vault / "trash" / "ToHidden.md").symlink_to(vault / ".hidden" / "Secret.md")
+    (vault / "Templates" / "ToKept.md").symlink_to(vault / "kept.md")  # leads somewhere visible: counted
+
+    assert server.browse()["not_listed"] == ("2 notes in Templates/ (note skeletons) and 1 note in trash/ "
+                                             "(deleted notes) aren't listed or counted.")
+
+
+def test_browse_does_not_count_a_note_whose_target_cannot_be_resolved(tmp_path, monkeypatch):
+    _vault_with(tmp_path, monkeypatch, {"Templates/Daily.md": "x", "Templates/Odd.md": "x"})
+    real_resolve = Path.resolve
+
+    def failing(self, strict=False):
+        if self.name == "Odd.md":
+            raise OSError("permission denied on a parent")
+        return real_resolve(self, strict)
+
+    monkeypatch.setattr(Path, "resolve", failing)
+    assert server.browse()["not_listed"] == "1 note in Templates/ (note skeletons) isn't listed or counted."
+
+
+def test_browse_says_nothing_about_skipped_folders_when_there_are_none_or_it_is_narrowed(tmp_path, monkeypatch):
+    _vault_with(tmp_path, monkeypatch, {"kept.md": "x", "Recipes/a.md": "x"})
+    assert "not_listed" not in server.browse()
+
+    _vault_with(tmp_path, monkeypatch, {"Templates/Daily.md": "x", "trash/gone.md": "x"})
+    assert "not_listed" not in server.browse(type="daily")
+    assert "not_listed" not in server.browse(folder="Recipes")
+
+
 def test_browse_notes_excludes_a_symlink_pointing_outside_the_vault(tmp_path, monkeypatch):
     vault = tmp_path / "vault"
     vault.mkdir()
