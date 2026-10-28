@@ -1098,8 +1098,8 @@ def _matching_notes(name: str) -> list[Path]:
     """
     filename = name if name.endswith(".md") else f"{name}.md"
 
-    target = (VAULT_PATH / filename).resolve()
-    if target.is_relative_to(VAULT_PATH) and target.is_file() and _is_readable(target):
+    named = Path(os.path.normpath(VAULT_PATH / filename))  # the path as asked for, before symlinks
+    if named.is_relative_to(VAULT_PATH) and _is_readable(named) and (target := named.resolve()).is_file():
         return [target]
     exact = sorted(p for p in VAULT_PATH.rglob("*.md") if p.name == filename and _is_readable(p))
     if exact:

@@ -6,6 +6,7 @@ import sqlite3
 import subprocess
 import sys
 from datetime import datetime
+from pathlib import Path
 
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
@@ -1856,6 +1857,35 @@ def test_a_visible_symlink_into_a_hidden_folder_is_not_read(tmp_path, monkeypatc
         with pytest.raises(ToolError, match="FileNotFoundError"):
             server.read_note(name)
     assert "Alias.md" not in str(server.browse())
+
+
+@pytest.mark.parametrize("alias", [".hidden/Alias.md", "trash/Alias.md", ".trash/sub/Alias.md"])
+def test_a_hidden_or_trashed_symlink_to_a_visible_note_is_not_read_by_its_name(tmp_path, monkeypatch, alias):
+    """The rule holds for the name asked for, not only for where it leads."""
+    _vault_with(tmp_path, monkeypatch, {"Visible.md": "VISIBLE"})
+    (tmp_path / alias).parent.mkdir(parents=True)
+    (tmp_path / alias).symlink_to(tmp_path / "Visible.md")
+
+    for name in (alias, alias[:-3], f"Other/../{alias}"):
+        for read in (lambda: server.read_note(name), lambda: server.read_note(name, include_revision=True),
+                     lambda: server.note_info(name)):
+            with pytest.raises(ToolError, match="FileNotFoundError"):
+                read()
+    assert server.read_note("Visible") == "VISIBLE"
+
+
+def test_a_note_whose_target_cannot_be_resolved_is_not_read(tmp_path, monkeypatch):
+    _vault_with(tmp_path, monkeypatch, {"Odd.md": "x"})
+    real_resolve = Path.resolve
+
+    def failing(self, strict=False):
+        if self.name == "Odd.md":
+            raise OSError("permission denied on a parent")
+        return real_resolve(self, strict)
+
+    monkeypatch.setattr(Path, "resolve", failing)
+    with pytest.raises(ToolError, match="FileNotFoundError"):
+        server.read_note("Odd.md")
 
 
 def test_a_template_can_still_be_read_by_its_exact_path(tmp_path, monkeypatch):
