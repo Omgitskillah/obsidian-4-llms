@@ -21,7 +21,7 @@ def issue(text):
 # ---------------------------------------------------------------- frontmatter it won't take
 @pytest.mark.parametrize('frontmatter, message', [
     ('a: &x 1\nb: *x\n', 'YAML aliases are unsupported'),
-    ('items:\n' + ''.join(f'  - {i}\n' for i in range(10001)), 'Frontmatter exceeds 10000 nodes'),
+    pytest.param('items:\n' + ''.join(f'  - {i}\n' for i in range(10001)), 'Frontmatter exceeds 10000 nodes', id='10001-nodes'),
     ('a:\n  ? [x]\n  : 1\n', 'Nested property keys must be scalar strings'),
     ('a:\n  <<: {b: 1}\n', 'YAML merge keys are unsupported'),
     ('? [x]\n: 1\n', 'Property keys must be scalar strings'),
@@ -69,21 +69,41 @@ def test_a_note_over_16_mib_is_not_read(tmp_path):
 def test_a_note_or_asset_changed_while_it_was_read_is_diagnosed(tmp_path, monkeypatch):
     (tmp_path / 'a.md').write_text('before')
     (tmp_path / 'b.png').write_bytes(b'image')
-    real_read, real_fstat = mutations.read, os.fstat
-    def read_then_edit(root, path):
+    real_read = mutations.read
+
+    def read_then_edit(root, path):  # a real edit, made while the note is being read
         data = real_read(root, path)
         path.write_text('edited while being read, and longer')
         return data
     monkeypatch.setattr(mutations, 'read', read_then_edit)
-    calls = []
-    def grows(fd):
-        info = real_fstat(fd)
-        calls.append(1)
-        return os.stat_result((*info[:6], info.st_size + len(calls) - 1, *info[7:])) if len(calls) > 1 else info
-    monkeypatch.setattr(stewardship.os, 'fstat', grows)
+    # The asset: stewardship's second look at b.png's open descriptor sees it a byte longer. Only
+    # stewardship's view of os, and only for that file; everything else sees the real fstat.
+    asset = (tmp_path / 'b.png').stat()
+    seen = []
+
+    class Grown:
+        def __init__(self, info):
+            self._info = info
+
+        def __getattr__(self, name):
+            return getattr(self._info, name)
+
+        @property
+        def st_size(self):
+            return self._info.st_size + 1
+
+    def fstat(fd):
+        info = os.fstat(fd)
+        if (info.st_dev, info.st_ino) != (asset.st_dev, asset.st_ino):
+            return info
+        seen.append(fd)
+        return Grown(info) if len(seen) == 2 else info
+
+    monkeypatch.setattr(stewardship, 'os', type('StewardshipOs', (), {'fstat': staticmethod(fstat),
+                                                                      '__getattr__': lambda self, name: getattr(os, name)})())
     scan = Snapshot(tmp_path).refresh()
     assert {'path': 'a.md', 'reason': 'changed_during_read'} in scan.diagnostics
-    assert {'path': 'b.png', 'reason': 'changed_during_read'} in scan.diagnostics
+    assert {'path': 'b.png', 'reason': 'changed_during_read'} in scan.diagnostics and len(seen) == 2
 
 
 def test_stopping_during_an_asset_hash_cancels_the_scan(tmp_path):

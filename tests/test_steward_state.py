@@ -202,10 +202,14 @@ def test_two_identical_new_notes_never_inherit_a_removed_notes_identity(tmp_path
     db = tmp_path / 'state.sqlite3'
     runner = Steward(vault, CONFIG, state_path=db)
     first = runner.run_once()['findings'][0]
-    (vault / 'a.md').unlink()
+    # Moved out of the vault, not deleted: its inode stays in use, so neither new note can be given it
+    # and match the old note's identity hint. Only the content is shared.
+    (vault / 'a.md').rename(tmp_path / 'a.md')
     (vault / 'b.md').write_text('Same text.')
     (vault / 'c.md').write_text('Same text.')
     report = runner.run_once()
+    hints = {runner.snapshot.documents[p].identity_hint for p in ('b.md', 'c.md')}
+    assert len(hints) == 2 and f"{(tmp_path / 'a.md').stat().st_dev}:{(tmp_path / 'a.md').stat().st_ino}" not in hints
     warnings = [d for d in report['diagnostics'] if d.get('reason') == 'ambiguous_rename_identity']
     assert sorted((w['path'], w['candidates']) for w in warnings) == [('b.md', ['a.md']), ('c.md', ['a.md'])]
     assert len(report['findings']) == 2 and first['status'] == 'open'
