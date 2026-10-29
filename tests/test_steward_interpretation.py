@@ -157,3 +157,68 @@ def test_attachment_revisions_revalidated(tmp_path):
         return supported(*args)
     row=interpret(scan,queue,edit,lambda _:100,approval=APPROVAL)['results'][0]
     assert row['status'] == 'INVALID' and 'Asset changed' in row['reason']
+
+
+# ---------------------------------------------------------------- F13: refusals before any model call
+from obsidian_mcp.steward_interpretation import InferenceResponse
+
+
+@pytest.mark.parametrize('requests, kwargs, message', [
+    ([], {'max_candidates': 0}, 'Candidate/excerpt bounds exceeded'),
+    ([], {'excerpt_chars': 99}, 'Candidate/excerpt bounds exceeded'),
+    ({'feature': 'properties'}, {}, 'requests must be an explicit candidate list'),
+    (['a.md'], {}, 'Candidate requests require feature/question/sources'),
+    ([{'feature': 'telepathy', 'question': 'q', 'sources': ['a.md']}], {}, 'Candidate requests require feature/question/sources'),
+    ([{'feature': 'properties', 'question': 'q', 'sources': []}], {}, 'Candidates require 1..4 eligible source notes'),
+    ([{'feature': 'properties', 'question': 'q', 'sources': ['missing.md']}], {}, 'Candidates require 1..4 eligible source notes'),
+    ([{'feature': 'properties', 'question': 'q', 'sources': ['bad.md']}], {}, 'Cannot interpret invalid frontmatter'),
+])
+def test_a_candidate_request_outside_its_bounds_is_refused(tmp_path, requests, kwargs, message):
+    scan, _ = setup(tmp_path)
+    (tmp_path / 'bad.md').write_text('---\na: 1\na: 2\n---\n')
+    with pytest.raises(ValueError, match=message):
+        candidates(scan.refresh(), requests, **kwargs)
+
+
+@pytest.mark.parametrize('approval', [RunApproval('', 'm', 'fake'), RunApproval('r', '', 'fake'), RunApproval('r', 'm', 'cloud'),
+                                      RunApproval('r', 'm', 'fake', max_candidates=0),
+                                      RunApproval('r', 'm', 'fake', max_output_tokens=5000),
+                                      RunApproval('r', 'm', 'fake', max_total_tokens=512, max_output_tokens=512)])
+def test_an_approval_without_a_sound_budget_or_identity_calls_nothing(tmp_path, approval):
+    scan, queue = setup(tmp_path)
+    with pytest.raises(ValueError, match='Invalid approved run budget or model identity'):
+        interpret(scan, queue, lambda *_: pytest.fail('called'), lambda _: 10, approval=approval)
+
+
+@pytest.mark.parametrize('count', [0, '10', None])
+def test_a_token_counter_that_does_not_count_stops_the_run(tmp_path, count):
+    scan, queue = setup(tmp_path)
+    with pytest.raises(ValueError, match='Token counter must include the rendered chat'):
+        interpret(scan, queue, lambda *_: pytest.fail('called'), lambda _: count, approval=APPROVAL)
+
+
+LIVE = RunApproval('live-run', 'model-v2', 'live')
+
+
+@pytest.mark.parametrize('answer, reason, stops', [
+    (lambda row: '{}', 'Live providers must return model identity and measured token usage', False),
+    (lambda row: InferenceResponse('{}', 'model-v1', 1, 1), 'Invalid measured usage/model identity', False),
+    (lambda row: InferenceResponse('{}', 'model-v2', -1, 1), 'Invalid measured usage/model identity', False),
+    (lambda row: InferenceResponse('{}', 'model-v2', 10**6, 1), 'Provider usage exceeds the reserved budget', True),
+])
+def test_a_live_answer_without_honest_usage_is_invalid_and_overspending_stops_the_run(tmp_path, answer, reason, stops):
+    scan, queue = setup(tmp_path)
+    report = interpret(scan, queue * 2, lambda system, user, maximum: answer(user), lambda _: 10, approval=LIVE)
+    assert report['results'][0]['status'] == 'INVALID' and reason in report['results'][0]['reason']
+    assert report['provider_calls'] == (1 if stops else 2) and report['budget_invalid'] is stops
+
+
+def test_a_live_answer_with_honest_usage_is_validated_and_its_usage_counted(tmp_path):
+    import json
+    scan, queue = setup(tmp_path)
+    def live(system, user, maximum):
+        return InferenceResponse(json.dumps(supported(system, user, maximum)), 'model-v2', 8, 20)
+    report = interpret(scan, queue, live, lambda _: 10, approval=LIVE)
+    assert report['results'][0]['status'] == 'VALIDATED_EVIDENCE_AND_CONSTRAINTS'
+    assert (report['model_calls'], report['measured_input_tokens'], report['measured_output_tokens']) == (1, 8, 20)
+    assert report['results'][0]['automatic_action_allowed'] is False
