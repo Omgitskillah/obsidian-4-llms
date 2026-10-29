@@ -148,3 +148,68 @@ def test_state_sidecar_symlink_cannot_write_outside_database(tmp_path, suffix):
     with pytest.raises(ValueError, match='symlink'):
         State(tmp_path / '.state.sqlite3', runner.snapshot)
     assert outside.read_bytes() == b'preserve me'
+
+
+# ---------------------------------------------------------------- F13: refusals
+import os
+import sys
+
+
+def test_a_state_file_must_be_an_sqlite_file(tmp_path):
+    with pytest.raises(ValueError, match=r'must end in \.sqlite3 or \.db'):
+        State(tmp_path / 'state.json', Steward(tmp_path, CONFIG).snapshot)
+
+
+def test_a_state_database_from_another_vault_is_refused(tmp_path):
+    first, second = tmp_path / 'first', tmp_path / 'second'
+    first.mkdir()
+    second.mkdir()
+    db = tmp_path / 'state.sqlite3'
+    State(db, Steward(first, CONFIG).snapshot).close()
+    with pytest.raises(ValueError, match='belongs to another vault'):
+        State(db, Steward(second, CONFIG).snapshot)
+
+
+def test_an_unknown_review_state_is_refused(tmp_path):
+    state = State(tmp_path / 'state.sqlite3', Steward(tmp_path / 'vault', CONFIG).snapshot)
+    try:
+        with pytest.raises(ValueError, match='acknowledged, suppressed, or open'):
+            state.review('x', 'y', 'deleted')
+    finally:
+        state.close()
+
+
+@pytest.mark.skipif(sys.platform == 'win32', reason='creating symlinks needs privileges on Windows')
+def test_a_symlink_slipped_in_beside_the_resolved_path_is_refused(tmp_path, monkeypatch):
+    """The first check sees the path as named; this one, the path it really leads to."""
+    db, elsewhere = tmp_path / 'state.sqlite3', tmp_path / 'elsewhere'
+    elsewhere.write_text('')
+    real_resolve = type(db).resolve
+    def resolve_then_race(self, *args, **kwargs):
+        resolved = real_resolve(self, *args, **kwargs)
+        if resolved == real_resolve(db) and not os.path.lexists(str(resolved) + '-wal'):
+            os.symlink(elsewhere, str(resolved) + '-wal')
+        return resolved
+    monkeypatch.setattr(type(db), 'resolve', resolve_then_race)
+    with pytest.raises(ValueError, match='cannot contain symlinks'):
+        State(db, Steward(tmp_path / 'vault', CONFIG).snapshot)
+
+
+def test_two_identical_new_notes_never_inherit_a_removed_notes_identity(tmp_path):
+    vault = tmp_path / 'vault'
+    vault.mkdir()
+    (vault / 'a.md').write_text('Same text.')
+    db = tmp_path / 'state.sqlite3'
+    runner = Steward(vault, CONFIG, state_path=db)
+    first = runner.run_once()['findings'][0]
+    # Moved out of the vault, not deleted: its inode stays in use, so neither new note can be given it
+    # and match the old note's identity hint. Only the content is shared.
+    (vault / 'a.md').rename(tmp_path / 'a.md')
+    (vault / 'b.md').write_text('Same text.')
+    (vault / 'c.md').write_text('Same text.')
+    report = runner.run_once()
+    hints = {runner.snapshot.documents[p].identity_hint for p in ('b.md', 'c.md')}
+    assert len(hints) == 2 and f"{(tmp_path / 'a.md').stat().st_dev}:{(tmp_path / 'a.md').stat().st_ino}" not in hints
+    warnings = [d for d in report['diagnostics'] if d.get('reason') == 'ambiguous_rename_identity']
+    assert sorted((w['path'], w['candidates']) for w in warnings) == [('b.md', ['a.md']), ('c.md', ['a.md'])]
+    assert len(report['findings']) == 2 and first['status'] == 'open'

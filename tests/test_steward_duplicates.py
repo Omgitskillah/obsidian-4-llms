@@ -30,3 +30,21 @@ def test_candidate_bound_and_delete(tmp_path):
     assert report['candidate_pairs_examined'] == 7
     (tmp_path / '0.md').unlink()
     assert all('0.md' not in p['paths'] for p in duplicates(scan.refresh(), max_pairs=7)['pairs'])
+
+
+import pytest
+
+
+@pytest.mark.parametrize('kwargs, message', [({'max_pairs': 0}, 'Candidate bounds'), ({'per_note': 51}, 'Candidate bounds'),
+                                             ({'max_pairs': True}, 'Candidate bounds'), ({'threshold': 0}, 'threshold must be in'),
+                                             ({'threshold': 1.5}, 'threshold must be in'), ({'threshold': '0.7'}, 'threshold must be in')])
+def test_candidate_bounds_and_threshold_are_checked(tmp_path, kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        duplicates(Snapshot(tmp_path).refresh(), **kwargs)
+
+
+def test_notes_sharing_a_little_wording_are_not_paired_below_the_threshold(tmp_path):
+    words = ' '.join(f'w{i}' for i in range(30))
+    (tmp_path / 'a.md').write_text('---\nscope: private\n---\n' + words + ' tail one two three four five')
+    (tmp_path / 'b.md').write_text('---\nscope: private\n---\n' + ' '.join(f'w{i}' for i in range(6)) + ' other words entirely here now and more')
+    assert duplicates(Snapshot(tmp_path).refresh(), threshold=0.9)['pairs'] == []

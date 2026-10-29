@@ -74,3 +74,55 @@ def test_incomplete_task_coverage_abstains(tmp_path):
     s.diagnostics.append({'path':'unreadable.md','reason':'read_failure'})
     with pytest.raises(ValueError,match='coverage'):
         prepare(s,'tasks',['a.md'],{})
+
+
+# ---------------------------------------------------------------- F13: abstentions and bounds
+def test_two_identical_notes_are_recorded_as_exactly_equal_but_no_merge_is_approved(tmp_path):
+    s = scan(tmp_path, {'a.md': '---\nscope: private\n---\nSame words.\n', 'b.md': '---\nscope: private\n---\nSame words.\n'})
+    row = prepare(s, 'duplicates', ['a.md', 'b.md'], {})
+    assert row['facts']['exact_bytes_equal'] is True and 'supported' in row['allowed_decisions']
+    assert {'type': 'compare', 'values': {}} in row['allowed_proposals']
+    assert 'no merge or deletion is approved' in ' '.join(row['factual_statements'])
+
+
+def test_an_ambiguous_link_offers_each_target_in_the_same_scope_and_no_other(tmp_path):
+    for folder in ('x', 'y', 'z'):
+        (tmp_path / folder).mkdir()
+    private = '---\nscope: private\n---\n'
+    s = scan(tmp_path, {'a.md': private + '[[target]]\n', 'x/target.md': private + 'The one in x.\n',
+                        'y/target.md': private + 'The one in y.\n', 'z/target.md': '---\nscope: shared\n---\nShared.\n'})
+    row = prepare(s, 'links', ['a.md'], {})
+    targets = {p['values']['target'] for p in row['allowed_proposals'] if p['type'] == 'replacement_target'}
+    assert targets == {'x/target.md', 'y/target.md'}
+    assert sorted(r['source'] for r in row['evidence'] if r['classification'] == 'eligible_target') == ['x/target.md', 'y/target.md']
+
+
+def test_an_ambiguous_link_between_notes_with_no_declared_scope_abstains(tmp_path):
+    """An empty target gives nothing to quote; the undeclared scopes then stop preparation."""
+    (tmp_path / 'x').mkdir()
+    (tmp_path / 'y').mkdir()
+    s = scan(tmp_path, {'a.md': '[[target]]\n', 'x/target.md': 'The one in x.\n', 'y/target.md': ''})
+    with pytest.raises(ValueError, match='undeclared or differing scope boundaries'):
+        prepare(s, 'links', ['a.md'], {})
+
+
+def test_preparation_abstains_without_evidence_or_past_its_bounds(tmp_path, monkeypatch):
+    from obsidian_mcp import steward_evidence
+    s = scan(tmp_path, {'empty.md': '', **{f'n{i}.md': f'note {i}\n' for i in range(21)}})
+    with pytest.raises(ValueError, match='No eligible evidence; preparation abstains'):
+        prepare(s, 'properties', ['empty.md'], {})
+    with pytest.raises(ValueError, match='Evidence bound exceeded'):
+        prepare(s, 'properties', [f'n{i}.md' for i in range(21)], {})
+    monkeypatch.setattr(steward_evidence, 'MAX_BYTES', 10)
+    with pytest.raises(ValueError, match='Evidence byte bound exceeded'):
+        prepare(s, 'properties', ['n1.md'], {})
+
+
+def test_notes_with_broken_frontmatter_are_not_evidence_even_if_the_scan_lost_its_diagnostic(tmp_path):
+    """Every frontmatter issue is also a scan diagnostic, refused first; the issue check is the backstop."""
+    s = scan(tmp_path, {'a.md': '---\na: 1\na: 2\n---\nBody.\n'})
+    with pytest.raises(ValueError, match='Incomplete or changed evidence coverage'):
+        prepare(s, 'properties', ['a.md'], {})
+    s.diagnostics = []
+    with pytest.raises(ValueError, match='Invalid evidence frontmatter'):
+        prepare(s, 'properties', ['a.md'], {})
