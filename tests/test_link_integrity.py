@@ -36,6 +36,8 @@ def rows(root, source, content, targets, policy=None):
     ('Home.md', '[[Target.md|display]]', 'Topics/Target.md', '', 'file_exists'),
     ('Home.md', '![[Target#Heading|caption]]', 'Target.md', '# Heading', 'heading_exists'),
     ('Home.md', '[[Target#Parent#Child]]', 'Target.md', '# Parent\n## Child', 'heading_exists'),
+    # A heading at or above the last one's level ends that branch: Second#Child, not First#Child#Second.
+    ('Home.md', '[[Target#Second#Child]]', 'Target.md', '# First\n## Child\n# Second\n## Child', 'heading_exists'),
     ('Home.md', '[[Target#^block-1]]', 'Target.md', 'Paragraph ^block-1', 'block_exists'),
     ('Home.md', '[[Target#^block-1]]', 'Target.md', 'Paragraph\n\n^block-1\n', 'block_exists'),
     ('Home.md', '[[#Heading]]', 'Unused.md', '', 'heading_exists'),

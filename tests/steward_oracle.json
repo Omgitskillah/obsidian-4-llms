@@ -1,0 +1,48 @@
+{
+  "version": "1",
+  "files": {
+    "Projects/A.md": "---\ntype: project\nproject: A\nstatus: active\nscope: private\nreview_due: 2026-10-01\n---\nProject A.\n",
+    "Inbox/capture.md": "---\nproject: A\nscope: private\n---\nA captured idea.\n",
+    "Tasks/current.md": "---\nproject: A\nscope: private\n---\n- [ ] Fix board [task:fix] [due:2026-10-01]\n",
+    "Tasks/mirror.md": "---\nproject: A\nscope: private\n---\n- [x] Board fixed [task:fix]\n",
+    "Claims/one.md": "---\n{\"scope\":\"private\",\"claims\":[{\"entity\":\"board-A\",\"field\":\"duration\",\"value\":\"1000\",\"unit\":\"ms\",\"scope\":\"idle\",\"date\":\"2026-10-08\",\"kind\":\"measurement\"}]}\n---\nDuration record one.\n",
+    "Claims/two.md": "---\n{\"scope\":\"private\",\"claims\":[{\"entity\":\"board-A\",\"field\":\"duration\",\"value\":\"2\",\"unit\":\"s\",\"scope\":\"idle\",\"date\":\"2026-10-08\",\"kind\":\"measurement\"}]}\n---\nDuration record two.\n",
+    "Costs.md": "| Item | Amount |\n|---|---:|\n| A | €1.20 |\n| B | €2.30 |\n| Total | €4.00 |\n",
+    "AssetRefs.md": "![[assets/a.png]]\n![[assets/missing.png]]\n[[Projects/A]]\n",
+    "Copy1.md": "---\nscope: private\n---\nThe same exact note bytes in both copies.\n",
+    "Copy2.md": "---\nscope: private\n---\nThe same exact note bytes in both copies.\n",
+    "Isolated.md": "An intentionally isolated clean note.\n",
+    "assets/a.png": "ABC",
+    "assets/b.png": "ABC"
+  },
+  "config": {
+    "packages": ["properties", "links", "attachments", "tasks", "tables", "reviews", "triage", "duplicates", "claims", "graph"],
+    "as_of": "2026-10-08",
+    "timezone": "Europe/Berlin",
+    "schemas": [{"name":"project","glob":"Projects/*.md","fields":{"owner":{"type":"string","required":true}}}],
+    "tables": [{"name":"money","columns":{"Item":{"type":"string"},"Amount":{"type":"number","currency":"€","required":true}},"totals":[{"label_column":"Item","label":"Total","column":"Amount","tolerance":"0"}]}],
+    "triage": {"inboxes":["Inbox/*.md"],"destinations":{"Projects":{"scope":"private"}},"rules":[{"field":"project","value":"A","destination":"Projects"}]},
+    "claims": {"duration":{"units":{"ms":{"factor":"1"},"s":{"factor":"1000"}},"tolerance":"0"}}
+  },
+  "oracle": {
+    "findings": [
+      ["properties", "Projects/A.md", "property.missing", 1],
+      ["links", "AssetRefs.md", "link.broken", 2],
+      ["attachments", "AssetRefs.md", "attachment.missing_embed", 2],
+      ["tasks", "Tasks/current.md", "task.overdue", 5],
+      ["tasks", "Tasks/current.md", "task.mirror_conflict", 5],
+      ["tasks", "Tasks/mirror.md", "task.mirror_conflict", 5],
+      ["tables", "Costs.md", "table.total", 5],
+      ["reviews", "Projects/A.md", "review.due", 6],
+      ["reviews", "Projects/A.md", "review.missing_next_action", 1],
+      ["triage", "Inbox/capture.md", "triage.route", 1],
+      ["claims", "Claims/one.md", "claim.conflict", 2]
+    ],
+    "exact_note_groups": [["Copy1.md", "Copy2.md"]],
+    "asset_duplicate_groups": [["assets/a.png", "assets/b.png"]],
+    "potential_duplicate_bytes": 3,
+    "graph_edges": [["AssetRefs.md", "Projects/A.md"]],
+    "table_expected_total": "3.50",
+    "route": "Projects"
+  }
+}
