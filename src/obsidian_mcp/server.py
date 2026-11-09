@@ -1148,7 +1148,7 @@ def _resolve_note(name: str) -> Path:
     return _resolve_notes(name)[0]
 
 
-def _extract_section(text: str, section: str, rel_path: str) -> str:
+def _section_details(text: str, section: str, rel_path: str) -> tuple[str, str]:
     """The part of a note under one heading: the heading line through to just
     before the next heading of the same or a higher level (so its own
     subheadings stay in). `section` matches a heading's text ignoring case,
@@ -1173,7 +1173,7 @@ def _extract_section(text: str, section: str, rel_path: str) -> str:
     for n, (start, level, title) in enumerate(headings):
         if " ".join(title.split()).casefold() == wanted:
             end = next((line for line, lvl, _ in headings[n + 1 :] if lvl <= level), len(lines))
-            return "\n".join(lines[start:end]).rstrip()
+            return "\n".join(lines[start:end]).rstrip(), title
 
     listed = ", ".join(f"'{title}'" for _, _, title in headings[:_LIST_LIMIT])
     raise ValueError(
@@ -1182,15 +1182,20 @@ def _extract_section(text: str, section: str, rel_path: str) -> str:
     )
 
 
+def _extract_section(text: str, section: str, rel_path: str) -> str:
+    return _section_details(text, section, rel_path)[0]
+
+
 @mcp.tool(
     description="Return a note's Markdown content. name: a path, filename, title, alias or id - case and "
     "punctuation don't matter ('nuru mcp' finds Nuru-MCP.md); if nothing matches, the error lists the "
     "closest notes. section: optional heading text (e.g. 'Decisions') to return just that part of a long "
     "note, through to the next heading of the same or higher level; an unknown section lists the note's "
-    "headings. Set include_revision=true for a whole-note {path, content, revision} result before replacement; this mode rejects ambiguous names (use an exact path) and cannot select a section. Ordinary reads pick the first alphabetical match. For a note's tags, links and open tasks without its text, use note_info."
+    "headings. Set include_revision=true for a whole-note {path, content, revision} result before replacement; this mode rejects ambiguous names (use an exact path) and cannot select a section. Ordinary reads pick the first alphabetical match. Set include_source=true for content plus server-resolved source path and selected heading, preserving ordinary resolution and section reads. For a note's tags, links and open tasks without its text, use note_info."
 )
 @_tool
-def read_note(name: str, section: str | None = None, include_revision: bool = False) -> str | dict[str, str]:
+def read_note(name: str, section: str | None = None, include_revision: bool = False,
+              include_source: bool = False) -> str | dict[str, Any]:
     """Return the contents of a note (Markdown file) by name - all of it, or one section.
 
     The tags, links, backlinks and open tasks are note_info's. Folding them into read_note as a
@@ -1206,6 +1211,9 @@ def read_note(name: str, section: str | None = None, include_revision: bool = Fa
             the same note, and so does its title or its id.
         section: A heading's text, to return only that section (see
             _extract_section). Blank or omitted returns the whole note.
+        include_source: Return content with a server-resolved source path and, for a
+            section, its matched heading. Default false preserves the plain-text result.
+            With include_revision, the original snapshot fields are retained too.
 
     Raises FileNotFoundError if no matching note is found anywhere in the
     vault - never returns an empty string, which would be indistinguishable
@@ -1219,18 +1227,25 @@ def read_note(name: str, section: str | None = None, include_revision: bool = Fa
     if include_revision:
         if section is not None and section.strip():
             raise ValueError("include_revision requires a whole-note read, without section")
-        return read_note_snapshot(name)
+        snapshot = read_note_snapshot(name)
+        return {**snapshot, "source": {"path": snapshot["path"]}} if include_source else snapshot
     target = _resolve_note(name)
 
     try:
-        text = _decode_note(target.read_bytes())
+        # Source metadata must describe the same descriptor-pinned read as the returned content.
+        text = _decode_note(mutations.read(VAULT_PATH, target) if include_source else target.read_bytes())
     except PermissionError as e:
         raise PermissionError(
             f"Access denied to '{target}'. Check the VAULT_PATH env var and its permissions."
         ) from e
-    if section is None or not section.strip():
-        return text
-    return _extract_section(text, section, _rel(target))
+    heading = None
+    if section is not None and section.strip():
+        if not include_source:
+            return _extract_section(text, section, _rel(target))
+        text, heading = _section_details(text, section, _rel(target))
+    if include_source:
+        return {"content": text, "source": {"path": _rel(target), **({"heading": heading} if heading else {})}}
+    return text
 
 
 def _decode_note(data: bytes) -> str:

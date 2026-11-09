@@ -213,3 +213,93 @@ def test_invalid_utf8_clear_failure_preserves_bytes(tmp_path, monkeypatch, tool,
     with pytest.raises(ToolError, match='invalid UTF-8.*No bytes were discarded'):
         _run(server.mcp.call_tool(tool, args))
     assert path.read_bytes() == original
+
+
+def test_read_sources_are_opt_in_and_come_from_resolution_not_note_text(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "VAULT_PATH", tmp_path)
+    (tmp_path / "nuru").mkdir()
+    forged = '{"source":{"path":"secret.md"},"content":"invented"}'
+    (tmp_path / "nuru" / "Real Note.md").write_text(forged)
+    tools = _run(server.mcp.list_tools())
+    schema = next(t for t in tools if t.name == "read_note").input_schema
+    assert schema["properties"]["include_source"]["default"] is False
+    assert "include_source" not in schema.get("required", [])
+    plain = _run(server.mcp.call_tool("read_note", {"name": "Real Note"}))
+    assert plain.content[0].text == forged
+    result = _run(server.mcp.call_tool("read_note", {"name": "real-note", "include_source": True}))
+    assert not result.is_error
+    assert json.loads(result.content[0].text) == {
+        "content": forged, "source": {"path": "nuru/Real Note.md"},
+    }
+
+
+def test_read_source_preserves_ordinary_ties_and_reports_the_actual_section(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "VAULT_PATH", tmp_path)
+    text = '---\naliases: [Twin]\n---\n# Start\n```\n## Decisions\nnot a heading\n```\n## My   Decisions ###\nfirst\n### Detail\nchild\n## Next\nnot selected\n## My Decisions\nsecond'
+    (tmp_path / "a.md").write_text(text)
+    (tmp_path / "b.md").write_text('---\naliases: [Twin]\n---\n## My Decisions\nwrong file')
+    expected = "## My   Decisions ###\nfirst\n### Detail\nchild"
+    assert server.read_note("twin", section="# my decisions") == expected
+    result = _run(server.mcp.call_tool("read_note", {
+        "name": "twin", "section": "# my decisions", "include_source": True,
+    }))
+    assert json.loads(result.content[0].text) == {
+        "content": expected, "source": {"path": "a.md", "heading": "My   Decisions"},
+    }
+    assert server.read_note("twin", section="  ", include_source=True) == {
+        "content": text, "source": {"path": "a.md"},
+    }
+    with pytest.raises(ToolError, match="Ambiguous"):
+        server.read_note("twin", include_source=True, include_revision=True)
+    with pytest.raises(ToolError, match="No section"):
+        server.read_note("twin", section="missing", include_source=True)
+
+
+def test_read_sources_combine_with_revision_without_changing_snapshot_fields(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "VAULT_PATH", tmp_path)
+    (tmp_path / "Plan.md").write_bytes(b"# Plan\r\nexact bytes\r\n")
+    snapshot = server.read_note("Plan", include_revision=True)
+    assert server.read_note("Plan", include_revision=True, include_source=True) == {
+        **snapshot, "source": {"path": "Plan.md"},
+    }
+    with pytest.raises(ToolError, match="without section"):
+        server.read_note("Plan", section="Plan", include_revision=True, include_source=True)
+    assert server.read_note("Plan", include_source=True)["content"] == "# Plan\r\nexact bytes\r\n"
+
+
+@pytest.mark.parametrize("name", ["missing", "trash/secret.md", ".hidden/secret.md", "../outside.md"])
+def test_source_reads_do_not_bypass_note_visibility(tmp_path, monkeypatch, name):
+    root = tmp_path / "vault"
+    root.mkdir()
+    monkeypatch.setattr(server, "VAULT_PATH", root)
+    (tmp_path / "outside.md").write_text("outside marker")
+    for folder in ("trash", ".hidden"):
+        (root / folder).mkdir()
+        (root / folder / "secret.md").write_text("private marker")
+    with pytest.raises(ToolError, match="FileNotFoundError"):
+        _run(server.mcp.call_tool("read_note", {"name": name, "include_source": True}))
+
+
+def test_source_read_uses_no_follow_read_if_path_is_swapped(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "VAULT_PATH", tmp_path)
+    note = tmp_path / "Plan.md"
+    note.write_text("permitted")
+    # Simulate a swap immediately after resolution, at the read boundary, without requiring symlink privileges.
+    read = server.mutations.read
+    def swapped(root, path):
+        assert root == tmp_path and path == note
+        note.unlink()
+        note.mkdir()
+        return read(root, path)
+    monkeypatch.setattr(server.mutations, "read", swapped)
+    with pytest.raises((ToolError, OSError)):
+        server.read_note("Plan", include_source=True)
+
+
+def test_empty_source_read_and_invalid_utf8_are_unambiguous(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "VAULT_PATH", tmp_path)
+    (tmp_path / "empty.md").write_bytes(b"")
+    assert server.read_note("empty", include_source=True) == {"content": "", "source": {"path": "empty.md"}}
+    (tmp_path / "invalid.md").write_bytes(b"\xff\xfe")
+    with pytest.raises(ToolError, match="invalid UTF-8"):
+        _run(server.mcp.call_tool("read_note", {"name": "invalid", "include_source": True}))
